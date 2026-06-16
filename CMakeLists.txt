@@ -1,0 +1,81 @@
+cmake_minimum_required(VERSION 3.16)
+
+project(aspira_trading VERSION 1.0.0 LANGUAGES C CXX)
+
+# Compiler flags
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Optimization flags
+set(CMAKE_C_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+set(CMAKE_C_FLAGS_DEBUG "-O0 -g -fsanitize=address,undefined")
+set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -fsanitize=address,undefined")
+
+# Common flags
+add_compile_options(-Wall -Wextra -Wpedantic)
+
+# Include directories
+include_directories(${CMAKE_SOURCE_DIR}/include)
+
+# Source files
+set(C_SOURCES
+    src/ring_buffer.c
+    src/memory_pool.c
+    src/logger.c
+    src/feed_handler.c
+    src/execution_gateway.c
+    src/journal.c
+)
+
+set(CXX_SOURCES
+    src/order_book.cpp
+    src/risk_engine.cpp
+    src/event_pipeline.cpp
+    src/main.cpp
+)
+
+# Main executable
+add_executable(trading_engine
+    ${C_SOURCES}
+    ${CXX_SOURCES}
+)
+
+# Link libraries
+target_link_libraries(trading_engine PRIVATE
+    pthread
+    rt
+)
+
+# Tests
+option(BUILD_TESTS "Build test executables" ON)
+if(BUILD_TESTS)
+    enable_testing()
+
+    add_executable(test_ring_buffer
+        tests/test_ring_buffer.c
+        src/ring_buffer.c
+    )
+    target_link_libraries(test_ring_buffer PRIVATE pthread rt)
+
+    add_executable(test_memory_pool
+        tests/test_memory_pool.c
+        src/memory_pool.c
+    )
+    target_link_libraries(test_memory_pool PRIVATE pthread rt)
+
+    add_executable(test_order_book
+        tests/test_order_book.cpp
+        src/order_book.cpp
+    )
+    target_link_libraries(test_order_book PRIVATE pthread rt)
+
+    add_test(NAME ring_buffer_test COMMAND test_ring_buffer)
+    add_test(NAME memory_pool_test COMMAND test_memory_pool)
+    add_test(NAME order_book_test COMMAND test_order_book)
+endif()
+
+# Install
+install(TARGETS trading_engine DESTINATION bin)

@@ -76,3 +76,9 @@ vcpkg_installed/
 Testing/
 .cache/
 .claude/
+
+# Benchmark & runtime output
+bench/logs/
+bench/bench_report_*.txt
+*.log
+*.jrnl
