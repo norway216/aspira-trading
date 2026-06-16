@@ -89,6 +89,13 @@ void feed_destroy(feed_handler_t *fh);
 ring_buffer_t *feed_get_output_queue(feed_handler_t *fh);
 
 /**
+ * Return a consumed message to the feed handler's memory pool.
+ * Must be called by the consumer after processing a message from the output queue.
+ * This replaces free() — the message is recycled, not deallocated.
+ */
+void feed_return_msg(feed_handler_t *fh, feed_msg_t *msg);
+
+/**
  * Get statistics about the feed handler.
  */
 void feed_get_stats(feed_handler_t *fh, uint64_t *msgs_received,

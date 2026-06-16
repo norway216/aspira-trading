@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 
 /* ---- Construction ---- */
@@ -29,12 +30,12 @@ void OrderBook::generate_trade(const Order &buy, const Order &sell,
     clock_gettime(CLOCK_REALTIME, &ts);
     t.timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 
-    /* Copy symbol */
+    /* Copy symbol with memcpy — faster than char-by-char loop */
     size_t sym_len = symbol_.size();
-    for (size_t i = 0; i < sizeof(t.symbol) - 1 && i < sym_len; i++) {
-        t.symbol[i] = static_cast<char>(symbol_[i]);
+    memcpy(t.symbol, symbol_.c_str(), sym_len < sizeof(t.symbol) ? sym_len : sizeof(t.symbol));
+    if (sym_len < sizeof(t.symbol)) {
+        t.symbol[sym_len] = '\0';
     }
-    t.symbol[std::min(sym_len, sizeof(t.symbol) - 1)] = '\0';
 
     trades_.push_back(t);
 }

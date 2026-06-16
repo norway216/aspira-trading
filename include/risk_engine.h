@@ -113,11 +113,11 @@ private:
 
     bool killed_;
 
-    /* Internal checks */
+    /* Internal checks — sym is pre-constructed once in validate() */
     bool check_order_size(const Order &order);
-    bool check_position_limit(const Order &order);
-    bool check_exposure_limit(const Order &order);
-    bool check_notional_limit(const Order &order);
+    bool check_position_limit(const Order &order, const std::string &sym);
+    bool check_exposure_limit(const Order &order, const std::string &sym);
+    bool check_notional_limit(const Order &order, const std::string &sym);
     bool check_price_band(const Order &order, double mid_price);
     bool check_rate_limit();
     void update_rate_window();

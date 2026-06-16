@@ -17,6 +17,10 @@ set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -fsanitize=address,undefined")
 # Common flags
 add_compile_options(-Wall -Wextra -Wpedantic)
 
+# Enable latency measurement by default. Add -DTRADING_NO_MEASURE_LATENCY
+# to CXXFLAGS to disable for absolute minimum latency in production.
+add_compile_definitions(TRADING_MEASURE_LATENCY)
+
 # Include directories
 include_directories(${CMAKE_SOURCE_DIR}/include)
 

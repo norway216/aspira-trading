@@ -57,8 +57,10 @@ bool ring_buffer_push(ring_buffer_t *rb, void *data) {
 
     /* Load head (producer-owned) */
     uint32_t head = __atomic_load_n(&rb->head, __ATOMIC_RELAXED);
-    /* Load tail (consumer-owned) — acquire to see consumer's frees */
-    uint32_t tail = __atomic_load_n(&rb->tail, __ATOMIC_ACQUIRE);
+    /* Load tail (consumer-owned). RELAXED is sufficient: producer only needs
+     * to know if the buffer is full; the actual slot ownership is guarded
+     * by the head release/acquire pair in push/pop respectively. */
+    uint32_t tail = __atomic_load_n(&rb->tail, __ATOMIC_RELAXED);
 
     uint32_t next = (head + 1) & rb->mask;
     if (next == tail) {
@@ -93,25 +95,23 @@ void *ring_buffer_pop(ring_buffer_t *rb) {
 
 uint32_t ring_buffer_count(const ring_buffer_t *rb) {
     if (!rb) return 0;
-    uint32_t head = __atomic_load_n(&rb->head, __ATOMIC_ACQUIRE);
-    uint32_t tail = __atomic_load_n(&rb->tail, __ATOMIC_ACQUIRE);
-    if (head >= tail) {
-        return head - tail;
-    } else {
-        return rb->capacity - (tail - head);
-    }
+    /* Snapshot — RELAXED is sufficient; inherently racy */
+    uint32_t head = __atomic_load_n(&rb->head, __ATOMIC_RELAXED);
+    uint32_t tail = __atomic_load_n(&rb->tail, __ATOMIC_RELAXED);
+    /* Branch-free: unsigned wraparound handled by mask */
+    return (head - tail) & rb->mask;
 }
 
 bool ring_buffer_empty(const ring_buffer_t *rb) {
     if (!rb) return true;
-    uint32_t head = __atomic_load_n(&rb->head, __ATOMIC_ACQUIRE);
-    uint32_t tail = __atomic_load_n(&rb->tail, __ATOMIC_ACQUIRE);
+    uint32_t head = __atomic_load_n(&rb->head, __ATOMIC_RELAXED);
+    uint32_t tail = __atomic_load_n(&rb->tail, __ATOMIC_RELAXED);
     return head == tail;
 }
 
 bool ring_buffer_full(const ring_buffer_t *rb) {
     if (!rb) return false;
     uint32_t head = __atomic_load_n(&rb->head, __ATOMIC_RELAXED);
-    uint32_t tail = __atomic_load_n(&rb->tail, __ATOMIC_ACQUIRE);
+    uint32_t tail = __atomic_load_n(&rb->tail, __ATOMIC_RELAXED);
     return ((head + 1) & rb->mask) == tail;
 }

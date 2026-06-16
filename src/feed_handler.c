@@ -5,6 +5,7 @@
  * In production mode, uses epoll + UDP socket.
  */
 #include "feed_handler.h"
+#include "memory_pool.h"
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -22,6 +23,7 @@
 struct feed_handler_t {
     feed_config_t config;
     ring_buffer_t output_queue;
+    mempool_t msg_pool;          /* pre-allocated pool for feed_msg_t */
 
     /* Thread */
     pthread_t recv_thread;
@@ -36,9 +38,8 @@ struct feed_handler_t {
     volatile uint64_t bytes_received;
 
     /* Simulation state */
-    double sim_base_price;
-    double sim_base_bid;
-    double sim_base_ask;
+    double   sim_base_price;
+    uint32_t prng_state;         /* per-handler xorshift32 state */
 };
 
 /* ---- Helpers ---- */
@@ -56,43 +57,41 @@ static void sleep_us(uint32_t us) {
     nanosleep(&ts, NULL);
 }
 
-/* Simple pseudo-random number generator (xorshift32).
- * We avoid rand() to prevent lock contention on the global PRNG state. */
-static uint32_t xorshift32_state = 2463534242U;
-
-static uint32_t xorshift32(void) {
-    uint32_t x = xorshift32_state;
+/* Per-handler xorshift32 PRNG. Avoids rand() lock contention.
+ * Each feed_handler_t has its own prng_state. */
+static uint32_t xorshift32(feed_handler_t *fh) {
+    uint32_t x = fh->prng_state;
     x ^= x << 13;
     x ^= x >> 17;
     x ^= x << 5;
-    xorshift32_state = x;
+    fh->prng_state = x;
     return x;
 }
 
 /* Generate a random double in [0, 1) */
-static double rand_double(void) {
-    return (double)(xorshift32() & 0xFFFFFF) / (double)0x1000000;
+static double rand_double(feed_handler_t *fh) {
+    return (double)(xorshift32(fh) & 0xFFFFFF) / (double)0x1000000;
 }
 
 /* Generate a simulated market data message */
 static void simulate_message(feed_handler_t *fh, feed_msg_t *msg) {
     /* Random walk for prices */
-    double noise = (rand_double() - 0.5) * 0.02;
+    double noise = (rand_double(fh) - 0.5) * 0.02;
     fh->sim_base_price += noise;
 
     /* Keep price in a reasonable range */
     if (fh->sim_base_price < 10.0) fh->sim_base_price = 10.0;
     if (fh->sim_base_price > 1000.0) fh->sim_base_price = 1000.0;
 
-    double spread_pct = 0.0001 + rand_double() * 0.0005; /* 1-5 bps */
+    double spread_pct = 0.0001 + rand_double(fh) * 0.0005; /* 1-5 bps */
 
     msg->bid_price = fh->sim_base_price * (1.0 - spread_pct / 2.0);
     msg->ask_price = fh->sim_base_price * (1.0 + spread_pct / 2.0);
-    msg->bid_size = (int32_t)(100 + rand_double() * 9900);  /* 100 - 10000 */
-    msg->ask_size = (int32_t)(100 + rand_double() * 9900);
+    msg->bid_size = (int32_t)(100 + rand_double(fh) * 9900);  /* 100 - 10000 */
+    msg->ask_size = (int32_t)(100 + rand_double(fh) * 9900);
     msg->last_price = fh->sim_base_price;
-    msg->last_size = (int32_t)(10 + rand_double() * 990);
-    msg->volume = (int32_t)(10000 + rand_double() * 990000);
+    msg->last_size = (int32_t)(10 + rand_double(fh) * 990);
+    msg->volume = (int32_t)(10000 + rand_double(fh) * 990000);
     msg->timestamp_ns = now_nanos();
     strncpy(msg->symbol, "AAPL", FEED_MAX_SYMBOL - 1);
     msg->symbol[FEED_MAX_SYMBOL - 1] = '\0';
@@ -112,8 +111,8 @@ static void *recv_thread_func(void *arg) {
         while (fh->running) {
             simulate_message(fh, &msg_buf);
 
-            /* Allocate a copy for the queue */
-            feed_msg_t *msg_copy = (feed_msg_t *)malloc(sizeof(feed_msg_t));
+            /* Allocate from pre-allocated pool — no malloc in hot path */
+            feed_msg_t *msg_copy = (feed_msg_t *)mempool_alloc(&fh->msg_pool);
             if (!msg_copy) {
                 fh->msgs_dropped++;
                 sleep_us(interval);
@@ -122,8 +121,8 @@ static void *recv_thread_func(void *arg) {
             memcpy(msg_copy, &msg_buf, sizeof(feed_msg_t));
 
             if (!ring_buffer_push(&fh->output_queue, msg_copy)) {
-                /* Queue full — drop the message */
-                free(msg_copy);
+                /* Queue full — drop the message, return to pool */
+                mempool_free(&fh->msg_pool, msg_copy);
                 fh->msgs_dropped++;
             } else {
                 fh->msgs_received++;
@@ -164,15 +163,12 @@ static void *recv_thread_func(void *arg) {
                     if (len > 0) {
                         fh->bytes_received += (uint64_t)len;
 
-                        /* Parse binary message into feed_msg_t.
-                         * In production, this would decode a real protocol.
-                         * Here we handle a simple struct copy for demo purposes. */
                         if ((size_t)len >= sizeof(feed_msg_t)) {
-                            feed_msg_t *msg_copy = (feed_msg_t *)malloc(sizeof(feed_msg_t));
+                            feed_msg_t *msg_copy = (feed_msg_t *)mempool_alloc(&fh->msg_pool);
                             if (msg_copy) {
                                 memcpy(msg_copy, raw_buf, sizeof(feed_msg_t));
                                 if (!ring_buffer_push(&fh->output_queue, msg_copy)) {
-                                    free(msg_copy);
+                                    mempool_free(&fh->msg_pool, msg_copy);
                                     fh->msgs_dropped++;
                                 } else {
                                     fh->msgs_received++;
@@ -206,6 +202,17 @@ feed_handler_t *feed_init(const feed_config_t *config) {
         free(fh);
         return NULL;
     }
+
+    /* Initialize message memory pool — pre-allocate feed_msg_t objects.
+     * Pool size equals ring buffer capacity so we never exhaust. */
+    if (mempool_init(&fh->msg_pool, sizeof(feed_msg_t), config->output_queue_size) != 0) {
+        ring_buffer_destroy(&fh->output_queue);
+        free(fh);
+        return NULL;
+    }
+
+    /* Seed per-handler PRNG */
+    fh->prng_state = 2463534242U + (uint32_t)((uintptr_t)fh);
 
     /* Set up UDP socket (production mode) */
     if (!config->simulation_mode) {
@@ -263,13 +270,14 @@ void feed_stop(feed_handler_t *fh) {
 void feed_destroy(feed_handler_t *fh) {
     if (!fh) return;
 
-    /* Drain and free any remaining messages in the queue */
+    /* Drain remaining messages (returned to pool, then pool is destroyed) */
     feed_msg_t *msg;
     while ((msg = (feed_msg_t *)ring_buffer_pop(&fh->output_queue)) != NULL) {
-        free(msg);
+        mempool_free(&fh->msg_pool, msg);
     }
 
     ring_buffer_destroy(&fh->output_queue);
+    mempool_destroy(&fh->msg_pool);
 
     if (fh->sockfd > 0) {
         close(fh->sockfd);
@@ -280,6 +288,12 @@ void feed_destroy(feed_handler_t *fh) {
 
 ring_buffer_t *feed_get_output_queue(feed_handler_t *fh) {
     return fh ? &fh->output_queue : NULL;
+}
+
+void feed_return_msg(feed_handler_t *fh, feed_msg_t *msg) {
+    if (fh && msg) {
+        mempool_free(&fh->msg_pool, msg);
+    }
 }
 
 void feed_get_stats(feed_handler_t *fh, uint64_t *msgs_received,

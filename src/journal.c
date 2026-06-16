@@ -47,14 +47,18 @@ static void crc32_init(void) {
     crc32_initialized = true;
 }
 
-static uint32_t crc32_compute(const void *data, size_t len) {
+/* Compute CRC32 over data, starting from initial value (0xFFFFFFFF for new CRC) */
+static uint32_t crc32_update(uint32_t crc, const void *data, size_t len) {
     crc32_init();
-    uint32_t crc = 0xFFFFFFFF;
     const uint8_t *p = (const uint8_t *)data;
     for (size_t i = 0; i < len; i++) {
         crc = (crc >> 8) ^ crc32_table[(crc ^ p[i]) & 0xFF];
     }
-    return crc ^ 0xFFFFFFFF;
+    return crc;
+}
+
+static uint32_t crc32_compute(const void *data, size_t len) {
+    return crc32_update(0xFFFFFFFF, data, len) ^ 0xFFFFFFFF;
 }
 
 static uint64_t now_nanos(void) {
@@ -148,33 +152,22 @@ int journal_append(journal_t *jrnl, journal_record_type_t type,
                    const void *payload, uint32_t payload_size) {
     if (!jrnl) return -1;
 
-    /* Build header */
+    /* Build header (no memset — all fields are set explicitly) */
     journal_header_t hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.timestamp_ns = now_nanos();
-    hdr.record_type = (uint32_t)type;
-    hdr.payload_size = payload_size;
-    hdr.sequence_number = jrnl->sequence++;
+    hdr.timestamp_ns     = now_nanos();
+    hdr.record_type      = (uint32_t)type;
+    hdr.payload_size     = payload_size;
+    hdr.sequence_number  = jrnl->sequence++;
+    hdr.crc32            = 0;
+    hdr._reserved        = 0;
 
-    /* Compute CRC32 over header (CRC32 field zeroed) + payload */
-    hdr.crc32 = 0;
-    uint32_t crc = crc32_compute(&hdr, sizeof(hdr));
+    /* Compute CRC32 incrementally: header (CRC=0) then payload.
+     * No malloc/free needed — two-pass CRC using the same state. */
+    uint32_t crc = crc32_update(0xFFFFFFFF, &hdr, sizeof(hdr));
     if (payload && payload_size > 0) {
-        crc = crc32_compute(payload, payload_size);
-        /* Combine: compute over both */
-        /* For simplicity, recompute over concatenated buffer */
-        size_t total = sizeof(hdr) + payload_size;
-        uint8_t *buf = (uint8_t *)malloc(total);
-        if (buf) {
-            memcpy(buf, &hdr, sizeof(hdr));
-            if (payload) {
-                memcpy(buf + sizeof(hdr), payload, payload_size);
-            }
-            crc = crc32_compute(buf, total);
-            free(buf);
-        }
+        crc = crc32_update(crc, payload, payload_size);
     }
-    hdr.crc32 = crc;
+    hdr.crc32 = crc ^ 0xFFFFFFFF;
 
     /* Write to journal */
     size_t total_size = sizeof(hdr) + payload_size;

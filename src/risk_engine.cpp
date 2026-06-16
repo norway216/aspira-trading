@@ -43,8 +43,7 @@ bool RiskEngine::check_order_size(const Order &order) {
     return true;
 }
 
-bool RiskEngine::check_position_limit(const Order &order) {
-    std::string sym(order.symbol);
+bool RiskEngine::check_position_limit(const Order &order, const std::string &sym) {
     auto it = positions_.find(sym);
     int32_t current_pos = (it != positions_.end()) ? it->second.net_position : 0;
 
@@ -64,8 +63,7 @@ bool RiskEngine::check_position_limit(const Order &order) {
     return true;
 }
 
-bool RiskEngine::check_exposure_limit(const Order &order) {
-    std::string sym(order.symbol);
+bool RiskEngine::check_exposure_limit(const Order &order, const std::string &sym) {
     auto it = positions_.find(sym);
     int32_t current_exp = (it != positions_.end()) ? it->second.gross_exposure : 0;
 
@@ -79,14 +77,13 @@ bool RiskEngine::check_exposure_limit(const Order &order) {
     return true;
 }
 
-bool RiskEngine::check_notional_limit(const Order &order) {
+bool RiskEngine::check_notional_limit(const Order &order, const std::string &sym) {
     if (order.price <= 0 && order.type == OrderType::LIMIT) {
-        return true; /* Can't compute notional without price */
+        return true;
     }
     double price = (order.price > 0) ? order.price : 1.0;
     double notional = price * (double)order.quantity;
 
-    std::string sym(order.symbol);
     auto it = positions_.find(sym);
     double current_notional = (it != positions_.end()) ? it->second.total_notional : 0.0;
 
@@ -145,12 +142,15 @@ bool RiskEngine::validate(const Order &order, double mid_price) {
 
     update_rate_window();
 
+    /* Construct symbol string once — reused by position/exposure/notional checks */
+    std::string sym(order.symbol);
+
     /* Run all checks — stop at first failure */
-    if (!check_rate_limit())        return false;
-    if (!check_order_size(order))   return false;
-    if (!check_position_limit(order)) return false;
-    if (!check_exposure_limit(order)) return false;
-    if (!check_notional_limit(order))  return false;
+    if (!check_rate_limit())               return false;
+    if (!check_order_size(order))          return false;
+    if (!check_position_limit(order, sym)) return false;
+    if (!check_exposure_limit(order, sym)) return false;
+    if (!check_notional_limit(order, sym)) return false;
     if (!check_price_band(order, mid_price)) return false;
 
     /* Track rate */

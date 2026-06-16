@@ -110,44 +110,41 @@ void EventPipeline::set_journal(journal_t *jrnl) {
 /* ---- Strategy Logic ---- */
 
 void EventPipeline::strategy_on_market_data(const feed_msg_t &msg,
-                                             std::vector<Order> &out_orders) {
-    /* Simple market-making-like strategy:
-     *   - If bid is attractive (close to our estimate), send a buy limit order
-     *   - If ask is attractive, send a sell limit order
-     *
-     * In production, this would be a much more sophisticated strategy engine.
-     */
+                                             Order *out_orders, int *out_count) {
+    /* Simple market-making-like strategy.
+     * Writes up to 2 orders into the pre-allocated out_orders array. */
 
     double mid = (msg.bid_price + msg.ask_price) / 2.0;
     double spread = msg.ask_price - msg.bid_price;
+    int count = 0;
 
     /* Place a buy order slightly below mid */
     {
-        Order buy_order;
+        Order &buy_order = out_orders[count++];
         buy_order.id = generate_order_id(next_order_id_);
         buy_order.account_id = 1;
-        buy_order.price = mid - spread * 0.1; /* 10% inside the spread */
+        buy_order.price = mid - spread * 0.1;
         buy_order.quantity = 100;
         buy_order.side = Side::BUY;
         buy_order.type = OrderType::LIMIT;
         buy_order.timestamp_ns = msg.timestamp_ns;
-        strncpy(buy_order.symbol, msg.symbol, sizeof(buy_order.symbol) - 1);
-        out_orders.push_back(buy_order);
+        memcpy(buy_order.symbol, msg.symbol, sizeof(buy_order.symbol));
     }
 
     /* Place a sell order slightly above mid */
     {
-        Order sell_order;
+        Order &sell_order = out_orders[count++];
         sell_order.id = generate_order_id(next_order_id_);
         sell_order.account_id = 1;
-        sell_order.price = mid + spread * 0.1; /* 10% inside the spread */
+        sell_order.price = mid + spread * 0.1;
         sell_order.quantity = 100;
         sell_order.side = Side::SELL;
         sell_order.type = OrderType::LIMIT;
         sell_order.timestamp_ns = msg.timestamp_ns;
-        strncpy(sell_order.symbol, msg.symbol, sizeof(sell_order.symbol) - 1);
-        out_orders.push_back(sell_order);
+        memcpy(sell_order.symbol, msg.symbol, sizeof(sell_order.symbol));
     }
+
+    *out_count = count;
 }
 
 /* ---- Hot Path ---- */
@@ -155,18 +152,22 @@ void EventPipeline::strategy_on_market_data(const feed_msg_t &msg,
 void EventPipeline::process_market_data(feed_msg_t *msg) {
     if (!msg) return;
 
+#ifdef TRADING_MEASURE_LATENCY
     uint64_t start_ns;
     struct timespec ts_start;
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
     start_ns = (uint64_t)ts_start.tv_sec * 1000000000ULL + (uint64_t)ts_start.tv_nsec;
+#endif
 
     stats_.market_data_msgs++;
 
     /* Stage 1: Strategy generates orders from market data */
-    std::vector<Order> orders;
-    strategy_on_market_data(*msg, orders);
+    Order orders[2];       /* stack-allocated: strategy produces exactly 2 orders */
+    int order_count = 0;
+    strategy_on_market_data(*msg, orders, &order_count);
 
-    for (auto &order : orders) {
+    for (int oi = 0; oi < order_count; oi++) {
+        Order &order = orders[oi];
         stats_.orders_created++;
 
         /* Stage 2: Risk validation */
@@ -272,22 +273,24 @@ void EventPipeline::process_market_data(feed_msg_t *msg) {
         }
     }
 
-    /* Free the market data message */
-    free(msg);
+    /* Return message to feed handler's memory pool */
+    feed_return_msg(feed_handler_, msg);
 
-    /* Latency measurement */
+#ifdef TRADING_MEASURE_LATENCY
+    /* Latency measurement — 2 clock_gettime syscalls per message.
+     * Disable with -DTRADING_NO_MEASURE_LATENCY for production. */
     struct timespec ts_end;
     clock_gettime(CLOCK_MONOTONIC, &ts_end);
     uint64_t end_ns = (uint64_t)ts_end.tv_sec * 1000000000ULL +
                       (uint64_t)ts_end.tv_nsec;
 
-    /* Exponential moving average of latency */
     double latency_us = (double)(end_ns - start_ns) / 1000.0;
     if (stats_.avg_latency_us == 0.0) {
         stats_.avg_latency_us = latency_us;
     } else {
         stats_.avg_latency_us = stats_.avg_latency_us * 0.9 + latency_us * 0.1;
     }
+#endif
 }
 
 /* ---- Consumer Thread ---- */
@@ -306,9 +309,11 @@ void EventPipeline::consumer_loop() {
     }
 
     /* Drain remaining messages on stop */
-    feed_msg_t *msg;
-    while ((msg = (feed_msg_t *)ring_buffer_pop(queue)) != NULL) {
-        process_market_data(msg);
+    {
+        feed_msg_t *drain_msg;
+        while ((drain_msg = (feed_msg_t *)ring_buffer_pop(queue)) != NULL) {
+            process_market_data(drain_msg);
+        }
     }
 }
 
