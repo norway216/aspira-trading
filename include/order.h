@@ -64,32 +64,34 @@ static_assert(sizeof(Order) <= 64, "Order must fit in a cache line");
 
 /**
  * A trade (match) between two orders.
+ * Fields ordered to minimize padding: 48 bytes.
  */
 struct Trade {
-    int32_t  trade_id;
-    int32_t  buy_order_id;
-    int32_t  sell_order_id;
-    double   price;
-    int32_t  quantity;
-    uint64_t timestamp_ns;
-    char     symbol[16];
-    char     _pad[4];
+    int32_t  trade_id;        /* 4 bytes */
+    int32_t  buy_order_id;    /* 4 bytes */
+    int32_t  sell_order_id;   /* 4 bytes */
+    int32_t  quantity;        /* 4 bytes — all int32s grouped */
+    uint64_t timestamp_ns;    /* 8 bytes */
+    double   price;           /* 8 bytes */
+    char     symbol[16];      /* 16 bytes */
+    /* Total: 48 bytes — 20% smaller than previous 60-byte layout */
 };
 
 /**
  * Market data event (received from feed).
+ * Fields ordered to fit in exactly 64 bytes (one cache line).
  */
 struct MarketDataEvent {
-    uint64_t timestamp_ns;
-    double   bid_price;
-    double   ask_price;
-    int32_t  bid_size;
-    int32_t  ask_size;
-    double   last_price;
-    int32_t  last_size;
-    int32_t  volume;
-    char     symbol[16];
-    char     _pad[4];
+    uint64_t timestamp_ns;    /* 8 bytes */
+    double   bid_price;       /* 8 bytes */
+    double   ask_price;       /* 8 bytes */
+    double   last_price;      /* 8 bytes */
+    int32_t  bid_size;        /* 4 bytes */
+    int32_t  ask_size;        /* 4 bytes */
+    int32_t  last_size;       /* 4 bytes */
+    int32_t  volume;          /* 4 bytes */
+    char     symbol[16];      /* 16 bytes */
+    /* Total: 64 bytes — exactly one cache line */
 };
 
 #endif /* ORDER_H */

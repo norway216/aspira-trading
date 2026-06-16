@@ -22,13 +22,20 @@
 #include <string>
 #include <vector>
 
+/* Forward-declare for OrderList typedef */
+struct OrderEntry;
+
+/* Price → list of orders at that price (time priority).
+ * Defined at file scope so OrderEntry can store its own iterator. */
+using OrderList = std::list<OrderEntry>;
+
 /**
  * An entry in a price-level queue.
+ * Stores its own list iterator for O(1) cancellation.
  */
 struct OrderEntry {
     Order order;
-    /* Iterator to this entry in the price-level list (for O(1) cancellation) */
-    void *list_iterator; /* type-erased — cast to std::list<OrderEntry>::iterator */
+    OrderList::iterator self_it; /* valid after insertion into list */
 };
 
 /**
@@ -119,8 +126,6 @@ public:
     void update_level(Side side, double price, int32_t size);
 
 private:
-    /* Price → list of orders at that price (time priority) */
-    using OrderList = std::list<OrderEntry>;
     using BidMap = std::map<double, OrderList, std::greater<double>>;
     using AskMap = std::map<double, OrderList, std::less<double>>;
 

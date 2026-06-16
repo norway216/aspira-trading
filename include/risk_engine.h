@@ -103,9 +103,23 @@ public:
     int32_t current_rate() const;
 
 private:
+    /* Transparent hash: enables heterogeneous lookup with const char*
+     * (no std::string construction needed for find/count). */
+    struct TransparentStringHash {
+        using is_transparent = void; /* enables heterogeneous lookup */
+        size_t operator()(const char *s) const {
+            size_t h = 0;
+            for (; *s; s++) h = h * 31 + (unsigned char)*s;
+            return h;
+        }
+        size_t operator()(const std::string &s) const {
+            return (*this)(s.c_str());
+        }
+    };
+
     RiskLimits limits_;
     std::string last_reject_;
-    std::unordered_map<std::string, Position> positions_;
+    std::unordered_map<std::string, Position, TransparentStringHash, std::equal_to<>> positions_;
 
     /* Rate limiting */
     int32_t order_count_this_sec_;

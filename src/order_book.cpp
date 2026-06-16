@@ -27,7 +27,7 @@ void OrderBook::generate_trade(const Order &buy, const Order &sell,
     t.quantity    = qty;
 
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     t.timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 
     /* Copy symbol with memcpy — faster than char-by-char loop */
@@ -178,7 +178,7 @@ Order OrderBook::add_order(const Order &order) {
 
         level_list->push_back(entry);
         auto it = std::prev(level_list->end());
-        it->list_iterator = nullptr; /* We don't need to store the iterator for now */
+        it->self_it = it; /* Store iterator for O(1) cancellation */
 
         /* Index the order for O(1) lookup */
         order_index_[result.id] = &(*it);
@@ -210,32 +210,21 @@ bool OrderBook::cancel_order(int32_t order_id) {
     OrderEntry *entry = it->second;
     entry->order.status = OrderStatus::CANCELLED;
 
-    /* Find and remove from price level */
+    /* O(1) removal via stored iterator */
+    double price = entry->order.price;
     if (entry->order.is_buy()) {
-        auto level_it = bids_.find(entry->order.price);
+        auto level_it = bids_.find(price);
         if (level_it != bids_.end()) {
-            OrderList &level = level_it->second;
-            for (auto list_it = level.begin(); list_it != level.end(); ++list_it) {
-                if (list_it->order.id == order_id) {
-                    level.erase(list_it);
-                    break;
-                }
-            }
-            if (level.empty()) {
+            level_it->second.erase(entry->self_it);
+            if (level_it->second.empty()) {
                 bids_.erase(level_it);
             }
         }
     } else {
-        auto level_it = asks_.find(entry->order.price);
+        auto level_it = asks_.find(price);
         if (level_it != asks_.end()) {
-            OrderList &level = level_it->second;
-            for (auto list_it = level.begin(); list_it != level.end(); ++list_it) {
-                if (list_it->order.id == order_id) {
-                    level.erase(list_it);
-                    break;
-                }
-            }
-            if (level.empty()) {
+            level_it->second.erase(entry->self_it);
+            if (level_it->second.empty()) {
                 asks_.erase(level_it);
             }
         }

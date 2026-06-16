@@ -55,17 +55,39 @@ int mempool_init(mempool_t *mp, size_t object_size, uint32_t capacity);
 void mempool_destroy(mempool_t *mp);
 
 /**
- * Allocate one object from the pool (O(1)).
+ * Allocate one object from the pool — O(1), static inline (hot path).
  * Returns NULL if the pool is exhausted.
- * Thread-safe — can be called from multiple threads.
+ * Safe for single-producer or multi-producer with __ATOMIC_RELAXED fetch_sub.
  */
-void *mempool_alloc(mempool_t *mp);
+static inline void *mempool_alloc(mempool_t *mp) {
+    /* Atomically decrement free_top. RELAXED sufficient: we only need
+     * atomicity of the counter; the free_list reads are guarded by the
+     * RELEASE store in mempool_free. */
+    uint32_t old_top = __atomic_fetch_sub(&mp->free_top, 1, __ATOMIC_RELAXED);
+    if (old_top == 0) {
+        __atomic_fetch_add(&mp->free_top, 1, __ATOMIC_RELAXED);
+        return NULL; /* Pool exhausted */
+    }
+    uint32_t idx = mp->free_list[old_top - 1];
+    return (char *)mp->pool + (size_t)idx * mp->object_size;
+}
 
 /**
- * Return an object to the pool (O(1)).
- * Thread-safe.
+ * Return an object to the pool — O(1), static inline (hot path).
+ * Writes index BEFORE the RELEASE store on free_top for correct visibility.
+ * Safe for single-consumer free; for multi-consumer, a CAS is needed.
  */
-void mempool_free(mempool_t *mp, void *ptr);
+static inline void mempool_free(mempool_t *mp, void *ptr) {
+    uintptr_t offset = (uintptr_t)((char *)ptr - (char *)mp->pool);
+    uint32_t idx = (uint32_t)(offset / mp->object_size);
+    if (idx >= mp->capacity) return; /* Not from this pool */
+
+    /* Read free_top, write index, then publish with RELEASE */
+    uint32_t slot = __atomic_load_n(&mp->free_top, __ATOMIC_RELAXED);
+    if (slot >= mp->capacity) return; /* Double-free guard */
+    mp->free_list[slot] = idx;
+    __atomic_store_n(&mp->free_top, slot + 1, __ATOMIC_RELEASE);
+}
 
 /**
  * Return the number of free objects remaining (snapshot).

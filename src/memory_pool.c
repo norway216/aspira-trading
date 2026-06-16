@@ -48,49 +48,6 @@ void mempool_destroy(mempool_t *mp) {
     mp->object_size = 0;
 }
 
-void *mempool_alloc(mempool_t *mp) {
-    if (!mp) return NULL;
-
-    /* Atomically decrement free_top. __ATOMIC_RELAXED is sufficient:
-     * we only need atomicity of the counter itself. */
-    uint32_t old_top = __atomic_fetch_sub(&mp->free_top, 1, __ATOMIC_RELAXED);
-    if (old_top == 0) {
-        /* Pool exhausted — undo the decrement */
-        __atomic_fetch_add(&mp->free_top, 1, __ATOMIC_RELAXED);
-        return NULL;
-    }
-
-    /* old_top was in [1, capacity]. Index is at free_list[old_top - 1].
-     * The free_list write (by mempool_free) happens-before the free_top
-     * increment via __ATOMIC_RELEASE, so this read is safe. */
-    uint32_t idx = mp->free_list[old_top - 1];
-    return (char *)mp->pool + (size_t)idx * mp->object_size;
-}
-
-void mempool_free(mempool_t *mp, void *ptr) {
-    if (!mp || !ptr) return;
-
-    uintptr_t offset = (uintptr_t)((char *)ptr - (char *)mp->pool);
-    uint32_t idx = (uint32_t)(offset / mp->object_size);
-
-    if (idx >= mp->capacity) {
-        return; /* Invalid pointer — not from this pool */
-    }
-
-    /* Write the index FIRST (before publishing the free_top increment).
-     * This ensures any consumer that sees the new free_top will also
-     * see the written index. The __ATOMIC_RELEASE on free_top guarantees
-     * this write is visible before the increment. */
-    uint32_t slot = __atomic_load_n(&mp->free_top, __ATOMIC_RELAXED);
-    if (slot >= mp->capacity) {
-        return; /* Double-free detected */
-    }
-    mp->free_list[slot] = idx;
-
-    /* Publish: release store ensures free_list[slot] is visible first */
-    __atomic_store_n(&mp->free_top, slot + 1, __ATOMIC_RELEASE);
-}
-
 uint32_t mempool_available(const mempool_t *mp) {
     if (!mp) return 0;
     return __atomic_load_n(&mp->free_top, __ATOMIC_RELAXED);

@@ -21,7 +21,7 @@ const RiskLimits &RiskEngine::limits() const {
 void RiskEngine::update_rate_window() {
     uint64_t now_sec;
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);  /* second resolution sufficient */
     now_sec = (uint64_t)ts.tv_sec;
 
     if (now_sec != sec_window_start_) {
@@ -165,8 +165,13 @@ const std::string &RiskEngine::last_reject_reason() const {
 
 void RiskEngine::on_order_executed(const Order &order, int32_t filled_qty,
                                     double fill_price) {
-    std::string sym(order.symbol);
-    Position &pos = positions_[sym];
+    /* Heterogeneous lookup: find with const char* — no std::string construction.
+     * If not found, emplace a new entry. */
+    auto it = positions_.find(order.symbol);
+    if (it == positions_.end()) {
+        it = positions_.emplace(std::string(order.symbol), Position{}).first;
+    }
+    Position &pos = it->second;
 
     if (order.is_buy()) {
         pos.net_position += filled_qty;
@@ -182,7 +187,7 @@ void RiskEngine::on_order_cancelled(const Order & /*order*/) {
 }
 
 Position RiskEngine::get_position(const std::string &symbol) const {
-    auto it = positions_.find(symbol);
+    auto it = positions_.find(symbol.c_str());
     if (it != positions_.end()) {
         return it->second;
     }
