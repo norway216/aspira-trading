@@ -26,13 +26,18 @@ extern "C" {
  * GCC __atomic builtins for C/C++ cross-language compatibility.
  */
 typedef struct {
+    /* free_top is the only hot field (atomic via multiple threads).
+     * Placed first on its own cache line to avoid false sharing
+     * with read-mostly fields below. */
+    uint32_t free_top;     /* top of free stack (atomic via __atomic builtins) */
+    char _pad1[MEMPOOL_CACHE_LINE - sizeof(uint32_t)];
+
+    /* Read-mostly fields — only written during init, read during operation */
     void *pool;            /* contiguous block of objects */
     uint32_t object_size;  /* size of each object */
     uint32_t capacity;     /* total number of objects */
-    /* free_top is on its own cache line */
-    uint32_t free_top;     /* top of free stack (atomic via __atomic builtins) */
-    char _pad[MEMPOOL_CACHE_LINE - sizeof(uint32_t)];
     uint32_t *free_list;   /* array of indices (the stack) */
+    char _pad2[4];         /* align to 8 bytes for free_list pointer */
 } mempool_t;
 
 /**

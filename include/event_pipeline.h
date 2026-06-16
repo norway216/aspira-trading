@@ -118,9 +118,10 @@ private:
     /* Order ID counter */
     volatile int32_t next_order_id_;
 
-    /* Strategy: generate orders from market data */
+    /* Strategy: generate orders from market data into pre-allocated array.
+     * Writes up to 2 orders to out_orders and sets *out_count. */
     void strategy_on_market_data(const feed_msg_t &msg,
-                                  std::vector<Order> &out_orders);
+                                  Order *out_orders, int *out_count);
 
     /* Consumer thread function */
     static void *consumer_thread_func(void *arg);

@@ -60,11 +60,16 @@ static void flush_entry(log_entry_t *entry, FILE *file) {
 
     fprintf(file, "%s.%09ld [%s] %s\n",
             time_buf, ns, level_str(entry->level), entry->message);
-    fflush(file);
+    /* fflush batched by caller — not per-entry */
 }
+
+#define LOG_FLUSH_BATCH 32  /* flush every N entries */
+#define LOG_FLUSH_US   10000 /* or every 10ms */
 
 static void *logger_thread(void *arg) {
     logger_t *log = (logger_t *)arg;
+    int batch_count = 0;
+    uint64_t last_flush_ns = 0;
 
     while (log->running) {
         log_entry_t *entry = (log_entry_t *)ring_buffer_pop(&log->queue);
@@ -73,7 +78,19 @@ static void *logger_thread(void *arg) {
             /* Return entry to the pool for reuse */
             entry->msg_len = 0;
             ring_buffer_push(&log->queue, entry);
+
+            /* Batch flush: every N entries or after 10ms */
+            batch_count++;
+            if (batch_count >= LOG_FLUSH_BATCH) {
+                fflush(log->file);
+                batch_count = 0;
+            }
         } else {
+            /* Flush if enough time has passed since last flush */
+            if (batch_count > 0) {
+                fflush(log->file);
+                batch_count = 0;
+            }
             /* Queue empty — brief sleep to avoid busy-waiting */
             usleep(100); /* 100 µs */
         }
@@ -86,6 +103,7 @@ static void *logger_thread(void *arg) {
         flush_entry(entry, log->file);
         entry->msg_len = 0;
     }
+    fflush(log->file);
 
     return NULL;
 }
