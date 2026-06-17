@@ -237,7 +237,9 @@ int journal_log_order(journal_t *jrnl, journal_record_type_t type,
                       uint64_t order_ts_ns, uint8_t side, uint8_t order_type,
                       uint8_t status, const char *symbol) {
     journal_order_payload_t payload;
-    memset(&payload, 0, sizeof(payload));
+    /* Set all fields explicitly — no memset needed.
+     * The _pad byte and any trailing bytes in symbol[] are
+     * uninitialized but won't be read by journal_append. */
     payload.order_id = order_id;
     payload.account_id = account_id;
     payload.price = price;
@@ -247,8 +249,12 @@ int journal_log_order(journal_t *jrnl, journal_record_type_t type,
     payload.side = side;
     payload.order_type = order_type;
     payload.status = status;
+    payload._pad = 0;
     if (symbol) {
         strncpy(payload.symbol, symbol, sizeof(payload.symbol) - 1);
+        payload.symbol[sizeof(payload.symbol) - 1] = '\0';
+    } else {
+        payload.symbol[0] = '\0';
     }
 
     return journal_append(jrnl, type, &payload, sizeof(payload));
@@ -259,15 +265,19 @@ int journal_log_trade(journal_t *jrnl, int32_t trade_id,
                       double price, int32_t qty, uint64_t trade_ts_ns,
                       const char *symbol) {
     journal_trade_payload_t payload;
-    memset(&payload, 0, sizeof(payload));
+    /* Set all fields explicitly — no memset needed */
     payload.trade_id = trade_id;
     payload.buy_order_id = buy_order_id;
     payload.sell_order_id = sell_order_id;
     payload.price = price;
     payload.quantity = qty;
     payload.trade_ts_ns = trade_ts_ns;
+    memset(payload._pad, 0, sizeof(payload._pad));
     if (symbol) {
         strncpy(payload.symbol, symbol, sizeof(payload.symbol) - 1);
+        payload.symbol[sizeof(payload.symbol) - 1] = '\0';
+    } else {
+        payload.symbol[0] = '\0';
     }
 
     return journal_append(jrnl, JRNL_TRADE, &payload, sizeof(payload));

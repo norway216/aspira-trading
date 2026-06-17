@@ -17,9 +17,10 @@
 #include "order.h"
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <list>
+#include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 /**
@@ -27,8 +28,6 @@
  */
 struct OrderEntry {
     Order order;
-    /* Iterator to this entry in the price-level list (for O(1) cancellation) */
-    void *list_iterator; /* type-erased — cast to std::list<OrderEntry>::iterator */
 };
 
 /**
@@ -119,7 +118,10 @@ public:
     void update_level(Side side, double price, int32_t size);
 
 private:
-    /* Price → list of orders at that price (time priority) */
+    /* Price → list of orders at that price (time priority).
+     * std::map is cache-unfriendly but offers ordered traversal for price levels.
+     * For HFT with few price levels (<500), this is acceptable — the O(log N)
+     * lookup is dwarfed by matching logic. For deeper books, consider boost::flat_map. */
     using OrderList = std::list<OrderEntry>;
     using BidMap = std::map<double, OrderList, std::greater<double>>;
     using AskMap = std::map<double, OrderList, std::less<double>>;
@@ -127,11 +129,18 @@ private:
     std::string symbol_;
     BidMap bids_;
     AskMap asks_;
-    std::vector<Trade> trades_;
 
-    /* Order ID → Order* for O(1) lookup (used for cancel/modify).
-     * Points into the OrderEntry inside bids_ or asks_. */
-    std::map<int32_t, OrderEntry *> order_index_;
+    /* Double-buffered trade storage: active_trades_ points to whichever buffer
+     * is currently receiving new trades. drain_trades() swaps the pointer and
+     * returns the old buffer contents — zero allocation in generate_trade(). */
+    std::vector<Trade> trades_buf_a_;
+    std::vector<Trade> trades_buf_b_;
+    std::vector<Trade> *active_trades_;
+
+    /* Order ID → list iterator for O(1) lookup AND O(1) cancellation.
+     * std::unordered_map provides true O(1) average lookup (vs std::map's O(log N)).
+     * The stored iterator allows direct list erasure without linear scanning. */
+    std::unordered_map<int32_t, OrderList::iterator> order_index_;
 
     int32_t next_trade_id_;
 
@@ -139,7 +148,6 @@ private:
     Order match_limit_order(Order &order);
     Order match_market_order(Order &order);
     void generate_trade(const Order &buy, const Order &sell, int32_t qty, double price);
-    void remove_from_level(OrderList &level_list, OrderList::iterator it, int32_t order_id);
 };
 
 #endif /* ORDER_BOOK_H */

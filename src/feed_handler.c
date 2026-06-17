@@ -93,7 +93,13 @@ static void simulate_message(feed_handler_t *fh, feed_msg_t *msg) {
     msg->last_size = (int32_t)(10 + rand_double(fh) * 990);
     msg->volume = (int32_t)(10000 + rand_double(fh) * 990000);
     msg->timestamp_ns = now_nanos();
-    strncpy(msg->symbol, "AAPL", FEED_MAX_SYMBOL - 1);
+    /* Use the symbol from configuration (set via event_pipeline).
+     * Falls back to "AAPL" if no symbol is configured. */
+    if (fh->config.symbol[0] != '\0') {
+        strncpy(msg->symbol, fh->config.symbol, FEED_MAX_SYMBOL - 1);
+    } else {
+        strncpy(msg->symbol, "AAPL", FEED_MAX_SYMBOL - 1);
+    }
     msg->symbol[FEED_MAX_SYMBOL - 1] = '\0';
 }
 

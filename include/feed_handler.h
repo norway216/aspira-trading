@@ -52,6 +52,7 @@ typedef struct {
     bool     simulation_mode;  /* Use simulated data instead of real socket */
     uint32_t sim_interval_us;  /* Microseconds between simulated messages */
     uint32_t output_queue_size; /* Ring buffer capacity for output */
+    char     symbol[FEED_MAX_SYMBOL]; /* Trading symbol for simulated messages */
 } feed_config_t;
 
 /**
