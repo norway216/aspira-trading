@@ -1,8 +1,14 @@
 /**
  * event_pipeline.cpp — Event Pipeline Implementation
  *
- * This is the main orchestration layer that wires together:
- *   Feed Handler → Strategy → Risk → Order Book → Execution Gateway
+ * Two-stage pipeline:
+ *   Stage 1 (Hot Path / Consumer Thread):
+ *     Feed → Strategy → Risk → Order Book → pushes IOEvent to io_queue_
+ *     Zero I/O in the hot path — no journal writes, no logging, no fprintf.
+ *
+ *   Stage 2 (I/O Thread):
+ *     Pops IOEvent from io_queue_ → journal log → logger → gateway dispatch.
+ *     All I/O is batched in this thread, keeping the hot path deterministic.
  */
 #include "event_pipeline.h"
 #include <cstdio>
@@ -11,10 +17,10 @@
 #include <ctime>
 #include <unistd.h>
 
-/* ---- Helper: generate a unique order ID ---- */
+/* ---- Helper: generate a unique order ID (relaxed atomic — no full barrier needed) ---- */
 
 static int32_t generate_order_id(volatile int32_t &counter) {
-    return __sync_fetch_and_add(&counter, 1);
+    return __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED);
 }
 
 /* ---- Construction / Destruction ---- */
@@ -27,9 +33,12 @@ EventPipeline::EventPipeline()
       gateway_(nullptr),
       feed_handler_(nullptr),
       running_(false),
+      io_event_pool_(nullptr),
       next_order_id_(1)
 {
     memset(&stats_, 0, sizeof(stats_));
+    memset(&io_free_queue_, 0, sizeof(io_free_queue_));
+    memset(&io_filled_queue_, 0, sizeof(io_filled_queue_));
 }
 
 EventPipeline::~EventPipeline() {
@@ -40,7 +49,7 @@ EventPipeline::~EventPipeline() {
 
 int EventPipeline::init(const std::string &symbol,
                          const std::string &log_path) {
-    /* 1. Logger */
+    /* 1. Logger (async — ring buffer + background thread) */
     logger_ = logger_init(log_path.c_str(), 4096);
     if (!logger_) {
         fprintf(stderr, "EventPipeline: failed to initialize logger\n");
@@ -92,11 +101,43 @@ int EventPipeline::init(const std::string &symbol,
     feed_cfg.simulation_mode = true;
     feed_cfg.sim_interval_us = 500;    /* 2000 msgs/sec */
     feed_cfg.output_queue_size = 4096;
+    strncpy(feed_cfg.symbol, symbol.c_str(), FEED_MAX_SYMBOL - 1);
 
     feed_handler_ = feed_init(&feed_cfg);
     if (!feed_handler_) {
         LOG_ERROR_(logger_, "Failed to create feed handler");
         return -1;
+    }
+
+    /* 6. I/O queues (hot path ↔ I/O thread).
+     * Two separate ring buffers — one for free events, one for filled events.
+     * This avoids the race condition inherent in single-queue designs where
+     * the producer could accidentally pop a filled entry it hasn't processed yet.
+     *
+     *   io_free_queue_:   free pool entries (hot path pops, I/O thread pushes)
+     *   io_filled_queue_: filled events (hot path pushes, I/O thread pops)
+     *
+     * Sized generously to absorb bursts — matches feed output queue size. */
+    if (ring_buffer_init(&io_free_queue_, 4096) != 0) {
+        LOG_ERROR_(logger_, "Failed to create I/O free queue");
+        return -1;
+    }
+    if (ring_buffer_init(&io_filled_queue_, 4096) != 0) {
+        LOG_ERROR_(logger_, "Failed to create I/O filled queue");
+        return -1;
+    }
+
+    /* Pre-allocate IOEvent pool.
+     * All entries start in io_free_queue_ — the hot path pops a free event,
+     * fills it, and pushes to io_filled_queue_. The I/O thread pops from
+     * io_filled_queue_, processes, and pushes back to io_free_queue_. */
+    io_event_pool_ = (IOEvent *)calloc(4096, sizeof(IOEvent));
+    if (!io_event_pool_) {
+        LOG_ERROR_(logger_, "Failed to allocate I/O event pool");
+        return -1;
+    }
+    for (uint32_t i = 0; i < 4096; i++) {
+        ring_buffer_push(&io_free_queue_, &io_event_pool_[i]);
     }
 
     LOG_INFO_(logger_, "EventPipeline initialized successfully");
@@ -147,7 +188,7 @@ void EventPipeline::strategy_on_market_data(const feed_msg_t &msg,
     *out_count = count;
 }
 
-/* ---- Hot Path ---- */
+/* ---- Hot Path (Stage 1: CPU-only, no I/O) ---- */
 
 void EventPipeline::process_market_data(feed_msg_t *msg) {
     if (!msg) return;
@@ -161,7 +202,7 @@ void EventPipeline::process_market_data(feed_msg_t *msg) {
 
     stats_.market_data_msgs++;
 
-    /* Stage 1: Strategy generates orders from market data */
+    /* Stage 1a: Strategy generates orders from market data */
     Order orders[2];       /* stack-allocated: strategy produces exactly 2 orders */
     int order_count = 0;
     strategy_on_market_data(*msg, orders, &order_count);
@@ -170,106 +211,103 @@ void EventPipeline::process_market_data(feed_msg_t *msg) {
         Order &order = orders[oi];
         stats_.orders_created++;
 
-        /* Stage 2: Risk validation */
+        /* Stage 1b: Risk validation */
         double mid = order_book_->mid_price();
         if (!risk_engine_->validate(order, mid)) {
             stats_.orders_rejected++;
-            LOG_WARN_(logger_, "Order %d REJECTED: %s",
-                      order.id, risk_engine_->last_reject_reason().c_str());
-            /* Journal the rejected order */
-            if (journal_) {
-                journal_log_order(journal_, JRNL_ORDER_REJECT,
-                                  order.id, order.account_id,
-                                  order.price, order.quantity, 0,
-                                  order.timestamp_ns,
-                                  (uint8_t)(order.is_buy() ? 0 : 1),
-                                  (uint8_t)(order.type == OrderType::LIMIT ? 0 : 1),
-                                  (uint8_t)OrderStatus::REJECTED,
-                                  order.symbol);
+
+            /* Pop a free IOEvent from the free queue and fill it */
+            IOEvent *ioev = (IOEvent *)ring_buffer_pop(&io_free_queue_);
+            if (ioev) {
+                ioev->type = IOEventType::ORDER_REJECTED;
+                ioev->order_id = order.id;
+                ioev->account_id = order.account_id;
+                ioev->price = order.price;
+                ioev->quantity = order.quantity;
+                ioev->filled_qty = 0;
+                ioev->timestamp_ns = order.timestamp_ns;
+                ioev->side = (uint8_t)(order.is_buy() ? 0 : 1);
+                ioev->order_type = (uint8_t)(order.type == OrderType::LIMIT ? 0 : 1);
+                ioev->status = (uint8_t)OrderStatus::REJECTED;
+                memcpy(ioev->symbol, order.symbol, sizeof(ioev->symbol));
+                strncpy(ioev->reject_reason, risk_engine_->last_reject_reason(),
+                        sizeof(ioev->reject_reason) - 1);
+                ioev->send_to_gateway = false;
+                ring_buffer_push(&io_filled_queue_, ioev);
             }
             continue;
         }
         stats_.orders_accepted++;
 
-        /* Stage 3: Submit to order book */
+        /* Stage 1c: Submit to order book */
         Order result = order_book_->add_order(order);
 
-        /* Journal the accepted order */
-        if (journal_) {
-            journal_log_order(journal_, JRNL_ORDER_NEW,
-                              result.id, result.account_id,
-                              result.price, result.quantity,
-                              result.filled_qty,
-                              result.timestamp_ns,
-                              (uint8_t)(result.is_buy() ? 0 : 1),
-                              (uint8_t)(result.type == OrderType::LIMIT ? 0 : 1),
-                              (uint8_t)result.status,
-                              result.symbol);
-        }
-
-        /* Stage 4: Handle fills */
-        if (result.filled_qty > 0) {
-            risk_engine_->on_order_executed(result, result.filled_qty,
-                                             result.price > 0 ? result.price : mid);
-
-            LOG_INFO_(logger_, "Order %d FILLED: %s %d@%.2f status=%d",
-                      result.id,
-                      result.is_buy() ? "BUY" : "SELL",
-                      result.filled_qty, result.price,
-                      (int)result.status);
-
-            /* Journal the fill */
-            if (journal_) {
-                journal_log_order(journal_, JRNL_ORDER_FILLED,
-                                  result.id, result.account_id,
-                                  result.price, result.quantity,
-                                  result.filled_qty,
-                                  result.timestamp_ns,
-                                  (uint8_t)(result.is_buy() ? 0 : 1),
-                                  (uint8_t)(result.type == OrderType::LIMIT ? 0 : 1),
-                                  (uint8_t)result.status,
-                                  result.symbol);
-            }
-        }
-
-        /* Stage 5: Send to execution gateway */
-        if (result.status == OrderStatus::NEW ||
-            result.status == OrderStatus::PARTIAL) {
-            char gw_msg[GW_MAX_MSG_SIZE];
+        /* Stage 1d: Prepare gateway serialization (CPU-only in hot path) */
+        bool send_to_gw = (result.status == OrderStatus::NEW ||
+                           result.status == OrderStatus::PARTIAL);
+        char gw_msg[GW_MAX_MSG_SIZE];
+        uint32_t gw_msg_len = 0;
+        if (send_to_gw) {
             char side_ch = result.is_buy() ? 'B' : 'S';
             char type_ch = (result.type == OrderType::LIMIT) ? 'L' : 'M';
-
             if (gw_serialize_order(gw_msg, sizeof(gw_msg),
                                     result.id, result.symbol,
                                     side_ch, type_ch,
                                     result.price, result.quantity,
                                     result.timestamp_ns) == 0) {
-                gw_send_order(gateway_, gw_msg, (uint32_t)strlen(gw_msg),
-                              result.id);
+                gw_msg_len = (uint32_t)strlen(gw_msg);
                 stats_.orders_executed++;
             }
+        }
+
+        /* Push order result to I/O queue — the I/O thread handles all
+         * journal writes, logging, and gateway dispatch. */
+        IOEvent *ioev = (IOEvent *)ring_buffer_pop(&io_free_queue_);
+        if (ioev) {
+            ioev->type = (result.filled_qty > 0) ? IOEventType::ORDER_FILLED
+                                                  : IOEventType::ORDER_ACCEPTED;
+            ioev->order_id = result.id;
+            ioev->account_id = result.account_id;
+            ioev->price = result.price;
+            ioev->quantity = result.quantity;
+            ioev->filled_qty = result.filled_qty;
+            ioev->timestamp_ns = result.timestamp_ns;
+            ioev->side = (uint8_t)(result.is_buy() ? 0 : 1);
+            ioev->order_type = (uint8_t)(result.type == OrderType::LIMIT ? 0 : 1);
+            ioev->status = (uint8_t)result.status;
+            memcpy(ioev->symbol, result.symbol, sizeof(ioev->symbol));
+            ioev->send_to_gateway = send_to_gw;
+            if (send_to_gw) {
+                memcpy(ioev->gw_msg, gw_msg, gw_msg_len + 1);
+                ioev->gw_msg_len = gw_msg_len;
+            }
+            ring_buffer_push(&io_filled_queue_, ioev);
         }
 
         /* Check for trades generated */
         std::vector<Trade> trades = order_book_->drain_trades();
         for (const auto &trade : trades) {
             stats_.trades_generated++;
-            LOG_INFO_(logger_,
-                      "TRADE id=%d %s %d@%.2f (buy=%d, sell=%d)",
-                      trade.trade_id, trade.symbol,
-                      trade.quantity, trade.price,
-                      trade.buy_order_id, trade.sell_order_id);
-            /* Journal the trade */
-            if (journal_) {
-                journal_log_trade(journal_,
-                                  trade.trade_id,
-                                  trade.buy_order_id,
-                                  trade.sell_order_id,
-                                  trade.price,
-                                  trade.quantity,
-                                  trade.timestamp_ns,
-                                  trade.symbol);
+
+            /* Push trade to I/O queue */
+            IOEvent *tev = (IOEvent *)ring_buffer_pop(&io_free_queue_);
+            if (tev) {
+                tev->type = IOEventType::TRADE;
+                tev->trade_id = trade.trade_id;
+                tev->buy_order_id = trade.buy_order_id;
+                tev->sell_order_id = trade.sell_order_id;
+                tev->trade_price = trade.price;
+                tev->trade_qty = trade.quantity;
+                tev->trade_ts_ns = trade.timestamp_ns;
+                memcpy(tev->trade_symbol, trade.symbol, sizeof(tev->trade_symbol));
+                ring_buffer_push(&io_filled_queue_, tev);
             }
+        }
+
+        /* Update risk engine positions for fills */
+        if (result.filled_qty > 0) {
+            risk_engine_->on_order_executed(result, result.filled_qty,
+                                             result.price > 0 ? result.price : mid);
         }
     }
 
@@ -293,7 +331,84 @@ void EventPipeline::process_market_data(feed_msg_t *msg) {
 #endif
 }
 
-/* ---- Consumer Thread ---- */
+/* ---- Stage 2: I/O Event Processing (I/O Thread) ---- */
+
+void EventPipeline::process_io_event(const IOEvent &event) {
+    switch (event.type) {
+    case IOEventType::ORDER_REJECTED:
+        LOG_WARN_(logger_, "Order %d REJECTED: %s",
+                  event.order_id, event.reject_reason);
+        if (journal_) {
+            journal_log_order(journal_, JRNL_ORDER_REJECT,
+                              event.order_id, event.account_id,
+                              event.price, event.quantity, 0,
+                              event.timestamp_ns,
+                              event.side, event.order_type,
+                              (uint8_t)OrderStatus::REJECTED,
+                              event.symbol);
+        }
+        break;
+
+    case IOEventType::ORDER_ACCEPTED:
+        if (journal_) {
+            journal_log_order(journal_, JRNL_ORDER_NEW,
+                              event.order_id, event.account_id,
+                              event.price, event.quantity,
+                              event.filled_qty,
+                              event.timestamp_ns,
+                              event.side, event.order_type,
+                              event.status,
+                              event.symbol);
+        }
+        if (event.send_to_gateway) {
+            gw_send_order(gateway_, event.gw_msg, event.gw_msg_len,
+                          event.order_id);
+        }
+        break;
+
+    case IOEventType::ORDER_FILLED:
+        LOG_INFO_(logger_, "Order %d FILLED: %s %d@%.2f status=%d",
+                  event.order_id,
+                  event.side == 0 ? "BUY" : "SELL",
+                  event.filled_qty, event.price,
+                  (int)event.status);
+        if (journal_) {
+            journal_log_order(journal_, JRNL_ORDER_FILLED,
+                              event.order_id, event.account_id,
+                              event.price, event.quantity,
+                              event.filled_qty,
+                              event.timestamp_ns,
+                              event.side, event.order_type,
+                              event.status,
+                              event.symbol);
+        }
+        if (event.send_to_gateway) {
+            gw_send_order(gateway_, event.gw_msg, event.gw_msg_len,
+                          event.order_id);
+        }
+        break;
+
+    case IOEventType::TRADE:
+        LOG_INFO_(logger_,
+                  "TRADE id=%d %s %d@%.2f (buy=%d, sell=%d)",
+                  event.trade_id, event.trade_symbol,
+                  event.trade_qty, event.trade_price,
+                  event.buy_order_id, event.sell_order_id);
+        if (journal_) {
+            journal_log_trade(journal_,
+                              event.trade_id,
+                              event.buy_order_id,
+                              event.sell_order_id,
+                              event.trade_price,
+                              event.trade_qty,
+                              event.trade_ts_ns,
+                              event.trade_symbol);
+        }
+        break;
+    }
+}
+
+/* ---- Consumer Thread (Stage 1: Hot Path) ---- */
 
 void EventPipeline::consumer_loop() {
     ring_buffer_t *queue = feed_get_output_queue(feed_handler_);
@@ -323,6 +438,38 @@ void *EventPipeline::consumer_thread_func(void *arg) {
     return nullptr;
 }
 
+/* ---- I/O Thread (Stage 2: Journal + Logging + Gateway) ---- */
+
+void EventPipeline::io_loop() {
+    while (running_) {
+        /* Pop from filled queue — only filled events arrive here */
+        IOEvent *event = (IOEvent *)ring_buffer_pop(&io_filled_queue_);
+        if (event) {
+            process_io_event(*event);
+
+            /* Return event to the free pool for reuse by the hot path */
+            ring_buffer_push(&io_free_queue_, event);
+        } else {
+            /* Queue empty — brief sleep to avoid busy-waiting */
+            usleep(50);
+        }
+    }
+
+    /* Drain remaining filled events on stop */
+    for (;;) {
+        IOEvent *event = (IOEvent *)ring_buffer_pop(&io_filled_queue_);
+        if (!event) break;
+        process_io_event(*event);
+        /* Don't return to free pool during drain — we're shutting down */
+    }
+}
+
+void *EventPipeline::io_thread_func(void *arg) {
+    EventPipeline *pipeline = static_cast<EventPipeline *>(arg);
+    pipeline->io_loop();
+    return nullptr;
+}
+
 /* ---- Start / Stop ---- */
 
 int EventPipeline::start() {
@@ -336,17 +483,26 @@ int EventPipeline::start() {
         return -1;
     }
 
-    /* Start consumer thread */
+    /* Start I/O thread first (must be ready to consume events) */
     running_ = true;
+    if (pthread_create(&io_thread_, nullptr, io_thread_func, this) != 0) {
+        running_ = false;
+        feed_stop(feed_handler_);
+        LOG_ERROR_(logger_, "Failed to create I/O thread");
+        return -1;
+    }
+
+    /* Start consumer thread (hot path) */
     if (pthread_create(&consumer_thread_, nullptr,
                        consumer_thread_func, this) != 0) {
         running_ = false;
+        pthread_join(io_thread_, nullptr);
         feed_stop(feed_handler_);
         LOG_ERROR_(logger_, "Failed to create consumer thread");
         return -1;
     }
 
-    LOG_INFO_(logger_, "EventPipeline started — processing events");
+    LOG_INFO_(logger_, "EventPipeline started — 2-stage pipeline active");
     return 0;
 }
 
@@ -355,12 +511,15 @@ void EventPipeline::stop() {
 
     LOG_INFO_(logger_, "EventPipeline stopping...");
 
-    /* Stop consumer thread */
+    /* Stop consumer thread first (no more events generated) */
     running_ = false;
     pthread_join(consumer_thread_, nullptr);
 
     /* Stop feed handler */
     feed_stop(feed_handler_);
+
+    /* Wait for I/O thread to drain remaining events */
+    pthread_join(io_thread_, nullptr);
 
     /* Shutdown gateway */
     gw_shutdown(gateway_);

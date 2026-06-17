@@ -11,7 +11,12 @@
 /* ---- Construction ---- */
 
 OrderBook::OrderBook(const std::string &symbol)
-    : symbol_(symbol), next_trade_id_(1) {}
+    : symbol_(symbol), active_trades_(&trades_buf_a_), next_trade_id_(1)
+{
+    /* Reserve initial capacity to avoid early reallocations */
+    trades_buf_a_.reserve(256);
+    trades_buf_b_.reserve(256);
+}
 
 OrderBook::~OrderBook() = default;
 
@@ -27,7 +32,7 @@ void OrderBook::generate_trade(const Order &buy, const Order &sell,
     t.quantity    = qty;
 
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_REALTIME, &ts);
     t.timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 
     /* Copy symbol with memcpy — faster than char-by-char loop */
@@ -37,14 +42,7 @@ void OrderBook::generate_trade(const Order &buy, const Order &sell,
         t.symbol[sym_len] = '\0';
     }
 
-    trades_.push_back(t);
-}
-
-void OrderBook::remove_from_level(OrderList &level_list,
-                                   OrderList::iterator it,
-                                   int32_t order_id) {
-    level_list.erase(it);
-    order_index_.erase(order_id);
+    active_trades_->push_back(t);
 }
 
 /* ---- Limit Order Matching ---- */
@@ -177,17 +175,18 @@ Order OrderBook::add_order(const Order &order) {
         }
 
         level_list->push_back(entry);
-        auto it = std::prev(level_list->end());
-        it->self_it = it; /* Store iterator for O(1) cancellation */
+        auto list_it = std::prev(level_list->end());
 
-        /* Index the order for O(1) lookup */
-        order_index_[result.id] = &(*it);
+        /* Index the order for O(1) lookup AND O(1) cancellation.
+         * Storing the list iterator enables direct erasure from the price level
+         * without linear scanning — critical for high-frequency cancel/modify. */
+        order_index_[result.id] = list_it;
 
         /* If the order was partially filled during matching, update status */
         if (result.filled_qty > 0) {
             result.status = OrderStatus::PARTIAL;
             /* Update the book copy's status too */
-            it->order.status = OrderStatus::PARTIAL;
+            list_it->order.status = OrderStatus::PARTIAL;
         }
     }
 
@@ -202,20 +201,26 @@ Order OrderBook::add_market_order(const Order &order) {
 }
 
 bool OrderBook::cancel_order(int32_t order_id) {
-    auto it = order_index_.find(order_id);
-    if (it == order_index_.end()) {
+    /* O(1) average lookup via unordered_map (was O(log N) with std::map) */
+    auto idx_it = order_index_.find(order_id);
+    if (idx_it == order_index_.end()) {
         return false;
     }
 
-    OrderEntry *entry = it->second;
-    entry->order.status = OrderStatus::CANCELLED;
+    /* Retrieve stored list iterator — enables O(1) erasure from price level.
+     * std::list iterators remain valid across insertions/erasures of other
+     * elements, so this iterator is stable until this specific element is erased. */
+    OrderList::iterator list_it = idx_it->second;
+    double price = list_it->order.price;
+    bool is_buy = list_it->order.is_buy();
 
-    /* O(1) removal via stored iterator */
-    double price = entry->order.price;
-    if (entry->order.is_buy()) {
+    list_it->order.status = OrderStatus::CANCELLED;
+
+    /* O(1) erase using stored iterator — eliminates the O(N) linear scan */
+    if (is_buy) {
         auto level_it = bids_.find(price);
         if (level_it != bids_.end()) {
-            level_it->second.erase(entry->self_it);
+            level_it->second.erase(list_it);
             if (level_it->second.empty()) {
                 bids_.erase(level_it);
             }
@@ -223,30 +228,30 @@ bool OrderBook::cancel_order(int32_t order_id) {
     } else {
         auto level_it = asks_.find(price);
         if (level_it != asks_.end()) {
-            level_it->second.erase(entry->self_it);
+            level_it->second.erase(list_it);
             if (level_it->second.empty()) {
                 asks_.erase(level_it);
             }
         }
     }
 
-    order_index_.erase(it);
+    order_index_.erase(idx_it);
     return true;
 }
 
 Order OrderBook::modify_order(int32_t order_id, double new_price, int32_t new_qty) {
-    auto it = order_index_.find(order_id);
-    if (it == order_index_.end()) {
+    auto idx_it = order_index_.find(order_id);
+    if (idx_it == order_index_.end()) {
         Order empty;
         empty.id = INVALID_ORDER_ID;
         empty.status = OrderStatus::REJECTED;
         return empty;
     }
 
-    OrderEntry *entry = it->second;
-    Order modified = entry->order;
+    /* Copy order data before cancellation invalidates the iterator */
+    Order modified = idx_it->second->order;
 
-    /* Cancel existing order */
+    /* Cancel existing order (invalidates the iterator, removes from index) */
     cancel_order(order_id);
 
     /* Re-insert with new price/qty (loses time priority) */
@@ -319,17 +324,25 @@ const std::string &OrderBook::symbol() const {
 }
 
 std::vector<Trade> OrderBook::drain_trades() {
+    /* Double-buffered swap: atomically swap the active buffer pointer,
+     * then return the old buffer's contents. generate_trade() always writes
+     * to *active_trades_, so this is safe without a mutex as long as
+     * drain_trades() is called from the same thread as generate_trade(). */
+    std::vector<Trade> *old_active = active_trades_;
+    active_trades_ = (active_trades_ == &trades_buf_a_) ? &trades_buf_b_ : &trades_buf_a_;
+    active_trades_->clear();
+
     std::vector<Trade> result;
-    result.swap(trades_);
+    result.swap(*old_active);
     return result;
 }
 
 const std::vector<Trade> &OrderBook::trades() const {
-    return trades_;
+    return *active_trades_;
 }
 
 size_t OrderBook::trade_count() const {
-    return trades_.size();
+    return active_trades_->size();
 }
 
 std::vector<OrderBook::PriceLevel>

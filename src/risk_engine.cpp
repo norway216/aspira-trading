@@ -1,12 +1,20 @@
 /**
  * risk_engine.cpp — Risk Engine Implementation
+ *
+ * All hot-path validation uses fixed char buffers (snprintf) instead of
+ * std::to_string/std::string concatenation — zero heap allocation.
+ * SymbolKey enables positions_ lookup without constructing std::string.
  */
 #include "risk_engine.h"
 #include <cmath>
+#include <cstdio>
 #include <ctime>
 
 RiskEngine::RiskEngine()
-    : order_count_this_sec_(0), sec_window_start_(0), killed_(false) {}
+    : order_count_this_sec_(0), sec_window_start_(0), killed_(false)
+{
+    last_reject_[0] = '\0';
+}
 
 RiskEngine::~RiskEngine() = default;
 
@@ -21,7 +29,7 @@ const RiskLimits &RiskEngine::limits() const {
 void RiskEngine::update_rate_window() {
     uint64_t now_sec;
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);  /* second resolution sufficient */
+    clock_gettime(CLOCK_REALTIME, &ts);
     now_sec = (uint64_t)ts.tv_sec;
 
     if (now_sec != sec_window_start_) {
@@ -32,18 +40,20 @@ void RiskEngine::update_rate_window() {
 
 bool RiskEngine::check_order_size(const Order &order) {
     if (order.quantity > limits_.max_order_qty) {
-        last_reject_ = "Order size " + std::to_string(order.quantity) +
-                       " exceeds limit " + std::to_string(limits_.max_order_qty);
+        snprintf(last_reject_, sizeof(last_reject_),
+                 "Order size %d exceeds limit %d",
+                 order.quantity, limits_.max_order_qty);
         return false;
     }
     if (order.quantity <= 0) {
-        last_reject_ = "Order quantity must be positive";
+        snprintf(last_reject_, sizeof(last_reject_),
+                 "Order quantity must be positive");
         return false;
     }
     return true;
 }
 
-bool RiskEngine::check_position_limit(const Order &order, const std::string &sym) {
+bool RiskEngine::check_position_limit(const Order &order, const SymbolKey &sym) {
     auto it = positions_.find(sym);
     int32_t current_pos = (it != positions_.end()) ? it->second.net_position : 0;
 
@@ -55,29 +65,29 @@ bool RiskEngine::check_position_limit(const Order &order, const std::string &sym
     }
 
     if (std::abs(new_pos) > limits_.max_position) {
-        last_reject_ = "Position " + std::to_string(new_pos) +
-                       " exceeds limit " + std::to_string(limits_.max_position) +
-                       " for " + sym;
+        snprintf(last_reject_, sizeof(last_reject_),
+                 "Position %d exceeds limit %d for %.16s",
+                 new_pos, limits_.max_position, sym.data);
         return false;
     }
     return true;
 }
 
-bool RiskEngine::check_exposure_limit(const Order &order, const std::string &sym) {
+bool RiskEngine::check_exposure_limit(const Order &order, const SymbolKey &sym) {
     auto it = positions_.find(sym);
     int32_t current_exp = (it != positions_.end()) ? it->second.gross_exposure : 0;
 
     int32_t new_exp = current_exp + order.quantity;
     if (new_exp > limits_.max_exposure) {
-        last_reject_ = "Gross exposure " + std::to_string(new_exp) +
-                       " exceeds limit " + std::to_string(limits_.max_exposure) +
-                       " for " + sym;
+        snprintf(last_reject_, sizeof(last_reject_),
+                 "Gross exposure %d exceeds limit %d for %.16s",
+                 new_exp, limits_.max_exposure, sym.data);
         return false;
     }
     return true;
 }
 
-bool RiskEngine::check_notional_limit(const Order &order, const std::string &sym) {
+bool RiskEngine::check_notional_limit(const Order &order, const SymbolKey &sym) {
     if (order.price <= 0 && order.type == OrderType::LIMIT) {
         return true;
     }
@@ -88,9 +98,9 @@ bool RiskEngine::check_notional_limit(const Order &order, const std::string &sym
     double current_notional = (it != positions_.end()) ? it->second.total_notional : 0.0;
 
     if (current_notional + notional > limits_.max_notional) {
-        last_reject_ = "Notional value " + std::to_string(notional) +
-                       " exceeds limit " + std::to_string(limits_.max_notional) +
-                       " for " + sym;
+        snprintf(last_reject_, sizeof(last_reject_),
+                 "Notional value %.2f exceeds limit %.2f for %.16s",
+                 notional, limits_.max_notional, sym.data);
         return false;
     }
     return true;
@@ -106,10 +116,9 @@ bool RiskEngine::check_price_band(const Order &order, double mid_price) {
 
     double deviation = std::abs(order.price - mid_price) / mid_price * 100.0;
     if (deviation > limits_.price_band_pct) {
-        last_reject_ = "Price " + std::to_string(order.price) +
-                       " deviates " + std::to_string(deviation) +
-                       "% from mid " + std::to_string(mid_price) +
-                       " (limit " + std::to_string(limits_.price_band_pct) + "%)";
+        snprintf(last_reject_, sizeof(last_reject_),
+                 "Price %.4f deviates %.2f%% from mid %.4f (limit %.2f%%)",
+                 order.price, deviation, mid_price, limits_.price_band_pct);
         return false;
     }
     return true;
@@ -120,19 +129,20 @@ bool RiskEngine::check_rate_limit() {
         return true; /* No rate limit */
     }
     if (order_count_this_sec_ >= limits_.max_orders_per_sec) {
-        last_reject_ = "Rate limit exceeded: " +
-                       std::to_string(order_count_this_sec_) +
-                       " orders in current second";
+        snprintf(last_reject_, sizeof(last_reject_),
+                 "Rate limit exceeded: %d orders in current second",
+                 order_count_this_sec_);
         return false;
     }
     return true;
 }
 
 bool RiskEngine::validate(const Order &order, double mid_price) {
-    last_reject_.clear();
+    last_reject_[0] = '\0';
 
     if (killed_) {
-        last_reject_ = "Risk engine killed — all orders rejected";
+        snprintf(last_reject_, sizeof(last_reject_),
+                 "Risk engine killed — all orders rejected");
         return false;
     }
 
@@ -142,8 +152,9 @@ bool RiskEngine::validate(const Order &order, double mid_price) {
 
     update_rate_window();
 
-    /* Construct symbol string once — reused by position/exposure/notional checks */
-    std::string sym(order.symbol);
+    /* Construct SymbolKey once on the stack — zero heap allocation.
+     * This single key is reused for all position/exposure/notional checks. */
+    SymbolKey sym(order.symbol);
 
     /* Run all checks — stop at first failure */
     if (!check_rate_limit())               return false;
@@ -159,19 +170,15 @@ bool RiskEngine::validate(const Order &order, double mid_price) {
     return true;
 }
 
-const std::string &RiskEngine::last_reject_reason() const {
+const char *RiskEngine::last_reject_reason() const {
     return last_reject_;
 }
 
 void RiskEngine::on_order_executed(const Order &order, int32_t filled_qty,
                                     double fill_price) {
-    /* Heterogeneous lookup: find with const char* — no std::string construction.
-     * If not found, emplace a new entry. */
-    auto it = positions_.find(order.symbol);
-    if (it == positions_.end()) {
-        it = positions_.emplace(std::string(order.symbol), Position{}).first;
-    }
-    Position &pos = it->second;
+    /* SymbolKey from order.symbol — stack copy, no allocation */
+    SymbolKey sym(order.symbol);
+    Position &pos = positions_[sym];
 
     if (order.is_buy()) {
         pos.net_position += filled_qty;
@@ -187,7 +194,17 @@ void RiskEngine::on_order_cancelled(const Order & /*order*/) {
 }
 
 Position RiskEngine::get_position(const std::string &symbol) const {
-    auto it = positions_.find(symbol.c_str());
+    SymbolKey key(symbol);
+    auto it = positions_.find(key);
+    if (it != positions_.end()) {
+        return it->second;
+    }
+    return Position{};
+}
+
+Position RiskEngine::get_position(const char *symbol) const {
+    SymbolKey key(symbol);
+    auto it = positions_.find(key);
     if (it != positions_.end()) {
         return it->second;
     }

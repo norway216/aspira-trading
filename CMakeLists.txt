@@ -9,13 +9,42 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Optimization flags
-set(CMAKE_C_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+# -O3: aggressive loop unrolling, vectorization, inlining
+# -march=native: enable CPU-specific instructions (AVX2, BMI2, etc.)
+# -flto: Link-Time Optimization — cross-TU inlining for hot functions
+#         (ring_buffer, mempool, feed_handler benefit significantly)
+# -DNDEBUG: disable assertions in release
+#
+# For C++: -fno-exceptions -fno-rtti (the codebase uses neither)
+#   Reduces binary size and improves code generation for virtual-free code.
+set(CMAKE_C_FLAGS_RELEASE "-O3 -march=native -flto -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -flto -fno-exceptions -fno-rtti -DNDEBUG")
 set(CMAKE_C_FLAGS_DEBUG "-O0 -g -fsanitize=address,undefined")
 set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -fsanitize=address,undefined")
 
+# Enable interprocedural optimization (LTO) for all configurations
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_DEBUG FALSE)
+
 # Common flags
 add_compile_options(-Wall -Wextra -Wpedantic)
+
+# Optional: Profile-Guided Optimization (PGO)
+# Usage:
+#   1. cmake .. -DCMAKE_BUILD_TYPE=Release -DPGO_GENERATE=ON
+#   2. Run the benchmark workload
+#   3. cmake .. -DCMAKE_BUILD_TYPE=Release -DPGO_USE=ON
+option(PGO_GENERATE "Generate PGO profile data" OFF)
+option(PGO_USE "Use PGO profile data for optimization" OFF)
+if(PGO_GENERATE)
+    add_compile_options(-fprofile-generate)
+    add_link_options(-fprofile-generate)
+    message(STATUS "PGO: Profile generation enabled")
+elseif(PGO_USE)
+    add_compile_options(-fprofile-use)
+    add_link_options(-fprofile-use)
+    message(STATUS "PGO: Profile-guided optimization enabled")
+endif()
 
 # Enable latency measurement by default. Add -DTRADING_NO_MEASURE_LATENCY
 # to CXXFLAGS to disable for absolute minimum latency in production.
