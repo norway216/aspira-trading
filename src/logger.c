@@ -1,9 +1,15 @@
 /**
  * logger.c — Async Logger Implementation
  *
- * Architecture:
- *   Hot path  →  ring_buffer_push()  →  (lock-free)
- *   Background thread  →  ring_buffer_pop()  →  fwrite()
+ * Two-ring-buffer architecture (correct SPSC design):
+ *   free_queue_:   pool of pre-allocated log_entry_t (hot path pops, I/O pushes)
+ *   filled_queue_: filled entries awaiting I/O (hot path pushes, I/O pops)
+ *
+ * Each ring buffer has exactly ONE producer and ONE consumer, avoiding
+ * the race condition inherent in single-queue double-ended designs.
+ *
+ * Hot path  →  pop from free_queue_ → fill → push to filled_queue_  (never blocks)
+ * I/O thread → pop from filled_queue_ → write → push to free_queue_
  */
 #include "logger.h"
 #include "ring_buffer.h"
@@ -12,21 +18,20 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
-/* Timespec helpers */
-#include <time.h>
-
 struct logger_t {
-    ring_buffer_t queue;
+    ring_buffer_t free_queue_;    /* free entries (hot path pops, I/O thread pushes) */
+    ring_buffer_t filled_queue_;  /* filled entries (hot path pushes, I/O thread pops) */
     FILE *file;
     bool running;
     bool owns_file;
     pthread_t thread;
-    log_entry_t *entry_pool;
+    log_entry_t *entry_pool;      /* Pre-allocated entries, queue_size total */
 };
 
-/* ---- Background thread ---- */
+/* ---- Helpers ---- */
 
 static uint64_t now_nanos(void) {
     struct timespec ts;
@@ -48,7 +53,6 @@ static const char *level_str(log_level_t level) {
 static void flush_entry(log_entry_t *entry, FILE *file) {
     if (!entry || !file || entry->msg_len == 0) return;
 
-    /* Convert nanosecond timestamp to human-readable */
     time_t sec = (time_t)(entry->timestamp_ns / 1000000000ULL);
     long ns = (long)(entry->timestamp_ns % 1000000000ULL);
 
@@ -60,48 +64,50 @@ static void flush_entry(log_entry_t *entry, FILE *file) {
 
     fprintf(file, "%s.%09ld [%s] %s\n",
             time_buf, ns, level_str(entry->level), entry->message);
-    /* fflush batched by caller — not per-entry */
 }
 
-#define LOG_FLUSH_BATCH 32  /* flush every N entries */
-#define LOG_FLUSH_US   10000 /* or every 10ms */
+/* Flush every N entries to batch I/O */
+#define LOG_FLUSH_BATCH 32
 
 static void *logger_thread(void *arg) {
     logger_t *log = (logger_t *)arg;
     int batch_count = 0;
-    uint64_t last_flush_ns = 0;
 
     while (log->running) {
-        log_entry_t *entry = (log_entry_t *)ring_buffer_pop(&log->queue);
+        /* Pop a filled entry from the filled queue */
+        log_entry_t *entry = (log_entry_t *)ring_buffer_pop(&log->filled_queue_);
         if (entry) {
             flush_entry(entry, log->file);
-            /* Return entry to the pool for reuse */
-            entry->msg_len = 0;
-            ring_buffer_push(&log->queue, entry);
 
-            /* Batch flush: every N entries or after 10ms */
+            /* Clear the message length so stale data isn't written */
+            entry->msg_len = 0;
+
+            /* Return the entry to the free pool for reuse by the hot path */
+            ring_buffer_push(&log->free_queue_, entry);
+
+            /* Batch flush: every N entries to reduce syscall overhead */
             batch_count++;
             if (batch_count >= LOG_FLUSH_BATCH) {
                 fflush(log->file);
                 batch_count = 0;
             }
         } else {
-            /* Flush if enough time has passed since last flush */
+            /* Flush any pending output when the queue is momentarily empty */
             if (batch_count > 0) {
                 fflush(log->file);
                 batch_count = 0;
             }
-            /* Queue empty — brief sleep to avoid busy-waiting */
-            usleep(100); /* 100 µs */
+            /* Brief sleep to avoid busy-waiting */
+            usleep(100);
         }
     }
 
-    /* Flush remaining entries on shutdown */
+    /* Drain remaining filled entries on shutdown */
     for (;;) {
-        log_entry_t *entry = (log_entry_t *)ring_buffer_pop(&log->queue);
+        log_entry_t *entry = (log_entry_t *)ring_buffer_pop(&log->filled_queue_);
         if (!entry) break;
         flush_entry(entry, log->file);
-        entry->msg_len = 0;
+        /* Don't return to free queue during shutdown — we're cleaning up */
     }
     fflush(log->file);
 
@@ -127,40 +133,42 @@ logger_t *logger_init(const char *filepath, uint32_t queue_size) {
         log->owns_file = true;
     }
 
-    /* Initialize ring buffer */
-    if (ring_buffer_init(&log->queue, queue_size) != 0) {
+    /* Initialize two ring buffers — one for free entries, one for filled.
+     * Each is strictly SPSC, guaranteeing no data races on head/tail. */
+    if (ring_buffer_init(&log->free_queue_, queue_size) != 0) {
+        if (log->owns_file) fclose(log->file);
+        free(log);
+        return NULL;
+    }
+    if (ring_buffer_init(&log->filled_queue_, queue_size) != 0) {
+        ring_buffer_destroy(&log->free_queue_);
         if (log->owns_file) fclose(log->file);
         free(log);
         return NULL;
     }
 
     /* Pre-allocate log entry pool.
-     * We allocate queue_size entries and push them all onto the queue
-     * as free slots. The producer pops a free one, fills it, pushes it back.
-     * The consumer pops a filled one, writes it, and pushes it back as free.
-     *
-     * This is a double-ended ring buffer pattern:
-     *   - Producer pops "free" entry, fills it, pushes "filled" entry
-     *   - Consumer pops "filled" entry, writes it, pushes "free" entry
-     *
-     * Both use the SAME ring buffer, so entries circulate.
-     */
+     * All entries start in free_queue_ — the hot path pops a free entry,
+     * fills it, and pushes to filled_queue_. The I/O thread pops from
+     * filled_queue_, writes to disk, and pushes back to free_queue_. */
     log->entry_pool = (log_entry_t *)calloc(queue_size, sizeof(log_entry_t));
     if (!log->entry_pool) {
-        ring_buffer_destroy(&log->queue);
+        ring_buffer_destroy(&log->free_queue_);
+        ring_buffer_destroy(&log->filled_queue_);
         if (log->owns_file) fclose(log->file);
         free(log);
         return NULL;
     }
     for (uint32_t i = 0; i < queue_size; i++) {
-        ring_buffer_push(&log->queue, &log->entry_pool[i]);
+        ring_buffer_push(&log->free_queue_, &log->entry_pool[i]);
     }
 
-    /* Start background thread */
+    /* Start background I/O thread */
     log->running = true;
     if (pthread_create(&log->thread, NULL, logger_thread, log) != 0) {
         log->running = false;
-        ring_buffer_destroy(&log->queue);
+        ring_buffer_destroy(&log->free_queue_);
+        ring_buffer_destroy(&log->filled_queue_);
         free(log->entry_pool);
         if (log->owns_file) fclose(log->file);
         free(log);
@@ -178,7 +186,8 @@ void logger_shutdown(logger_t *log) {
 
 void logger_destroy(logger_t *log) {
     if (!log) return;
-    ring_buffer_destroy(&log->queue);
+    ring_buffer_destroy(&log->free_queue_);
+    ring_buffer_destroy(&log->filled_queue_);
     free(log->entry_pool);
     if (log->owns_file) fclose(log->file);
     free(log);
@@ -187,11 +196,11 @@ void logger_destroy(logger_t *log) {
 void logger_write(logger_t *log, log_level_t level, const char *fmt, ...) {
     if (!log || !fmt) return;
 
-    /* Pop a free entry from the ring buffer */
-    log_entry_t *entry = (log_entry_t *)ring_buffer_pop(&log->queue);
+    /* Pop a free entry from the free queue (hot path is the consumer here) */
+    log_entry_t *entry = (log_entry_t *)ring_buffer_pop(&log->free_queue_);
     if (!entry) {
-        /* Queue is full (all entries are filled and waiting to be written).
-         * Drop this message — we never block the hot path. */
+        /* All entries are currently filled and waiting to be written.
+         * Drop this message — the hot path never blocks on I/O. */
         return;
     }
 
@@ -203,6 +212,6 @@ void logger_write(logger_t *log, log_level_t level, const char *fmt, ...) {
     entry->msg_len = (uint16_t)vsnprintf(entry->message, LOG_MAX_MSG_LEN, fmt, args);
     va_end(args);
 
-    /* Push the filled entry back onto the ring buffer */
-    ring_buffer_push(&log->queue, entry);
+    /* Push the filled entry to the filled queue for the I/O thread */
+    ring_buffer_push(&log->filled_queue_, entry);
 }

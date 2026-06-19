@@ -31,7 +31,9 @@ struct SymbolKey {
 
     SymbolKey() { memset(data, 0, sizeof(data)); }
     explicit SymbolKey(const char *src) {
-        memcpy(data, src, 16);
+        size_t n = strnlen(src, 16);
+        memcpy(data, src, n);
+        if (n < 16) memset(data + n, 0, 16 - n);
     }
     explicit SymbolKey(const std::string &src) {
         size_t n = src.size();

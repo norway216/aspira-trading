@@ -44,6 +44,7 @@ struct PipelineStats {
     uint64_t orders_rejected;
     uint64_t trades_generated;
     uint64_t orders_executed;
+    uint64_t io_events_dropped; /* I/O events dropped (free queue exhausted) */
     double   avg_latency_us;
 };
 

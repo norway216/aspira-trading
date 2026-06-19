@@ -27,15 +27,15 @@ struct feed_handler_t {
 
     /* Thread */
     pthread_t recv_thread;
-    volatile bool running;
+    _Atomic bool running;
 
     /* Sockets (production mode) */
     int sockfd;
 
-    /* Stats */
-    volatile uint64_t msgs_received;
-    volatile uint64_t msgs_dropped;
-    volatile uint64_t bytes_received;
+    /* Stats — atomic for cross-thread visibility */
+    _Atomic uint64_t msgs_received;
+    _Atomic uint64_t msgs_dropped;
+    _Atomic uint64_t bytes_received;
 
     /* Simulation state */
     double   sim_base_price;
@@ -114,13 +114,13 @@ static void *recv_thread_func(void *arg) {
         fh->sim_base_price = 150.0; /* Starting price for AAPL */
         uint32_t interval = fh->config.sim_interval_us;
 
-        while (fh->running) {
+        while (__atomic_load_n(&fh->running, __ATOMIC_RELAXED)) {
             simulate_message(fh, &msg_buf);
 
             /* Allocate from pre-allocated pool — no malloc in hot path */
             feed_msg_t *msg_copy = (feed_msg_t *)mempool_alloc(&fh->msg_pool);
             if (!msg_copy) {
-                fh->msgs_dropped++;
+                __atomic_fetch_add(&fh->msgs_dropped, 1, __ATOMIC_RELAXED);
                 sleep_us(interval);
                 continue;
             }
@@ -129,10 +129,10 @@ static void *recv_thread_func(void *arg) {
             if (!ring_buffer_push(&fh->output_queue, msg_copy)) {
                 /* Queue full — drop the message, return to pool */
                 mempool_free(&fh->msg_pool, msg_copy);
-                fh->msgs_dropped++;
+                __atomic_fetch_add(&fh->msgs_dropped, 1, __ATOMIC_RELAXED);
             } else {
-                fh->msgs_received++;
-                fh->bytes_received += sizeof(feed_msg_t);
+                __atomic_fetch_add(&fh->msgs_received, 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&fh->bytes_received, sizeof(feed_msg_t), __ATOMIC_RELAXED);
             }
 
             sleep_us(interval);
@@ -158,7 +158,7 @@ static void *recv_thread_func(void *arg) {
 
         char raw_buf[FEED_MAX_MSG_SIZE];
 
-        while (fh->running) {
+        while (__atomic_load_n(&fh->running, __ATOMIC_RELAXED)) {
             struct epoll_event events[64];
             int n = epoll_wait(epfd, events, 64, 100); /* 100ms timeout */
 
@@ -167,7 +167,7 @@ static void *recv_thread_func(void *arg) {
                     ssize_t len = recv(events[i].data.fd, raw_buf,
                                        sizeof(raw_buf), 0);
                     if (len > 0) {
-                        fh->bytes_received += (uint64_t)len;
+                        __atomic_fetch_add(&fh->bytes_received, (uint64_t)len, __ATOMIC_RELAXED);
 
                         if ((size_t)len >= sizeof(feed_msg_t)) {
                             feed_msg_t *msg_copy = (feed_msg_t *)mempool_alloc(&fh->msg_pool);
@@ -175,12 +175,12 @@ static void *recv_thread_func(void *arg) {
                                 memcpy(msg_copy, raw_buf, sizeof(feed_msg_t));
                                 if (!ring_buffer_push(&fh->output_queue, msg_copy)) {
                                     mempool_free(&fh->msg_pool, msg_copy);
-                                    fh->msgs_dropped++;
+                                    __atomic_fetch_add(&fh->msgs_dropped, 1, __ATOMIC_RELAXED);
                                 } else {
-                                    fh->msgs_received++;
+                                    __atomic_fetch_add(&fh->msgs_received, 1, __ATOMIC_RELAXED);
                                 }
                             } else {
-                                fh->msgs_dropped++;
+                                __atomic_fetch_add(&fh->msgs_dropped, 1, __ATOMIC_RELAXED);
                             }
                         }
                     }
@@ -258,9 +258,9 @@ feed_handler_t *feed_init(const feed_config_t *config) {
 int feed_start(feed_handler_t *fh) {
     if (!fh) return -1;
 
-    fh->running = true;
+    __atomic_store_n(&fh->running, true, __ATOMIC_RELAXED);
     if (pthread_create(&fh->recv_thread, NULL, recv_thread_func, fh) != 0) {
-        fh->running = false;
+        __atomic_store_n(&fh->running, false, __ATOMIC_RELAXED);
         return -1;
     }
 
@@ -269,7 +269,7 @@ int feed_start(feed_handler_t *fh) {
 
 void feed_stop(feed_handler_t *fh) {
     if (!fh) return;
-    fh->running = false;
+    __atomic_store_n(&fh->running, false, __ATOMIC_RELAXED);
     pthread_join(fh->recv_thread, NULL);
 }
 
@@ -305,7 +305,7 @@ void feed_return_msg(feed_handler_t *fh, feed_msg_t *msg) {
 void feed_get_stats(feed_handler_t *fh, uint64_t *msgs_received,
                     uint64_t *msgs_dropped, uint64_t *bytes_received) {
     if (!fh) return;
-    if (msgs_received)  *msgs_received  = fh->msgs_received;
-    if (msgs_dropped)   *msgs_dropped   = fh->msgs_dropped;
-    if (bytes_received) *bytes_received = fh->bytes_received;
+    if (msgs_received)  *msgs_received  = __atomic_load_n(&fh->msgs_received, __ATOMIC_RELAXED);
+    if (msgs_dropped)   *msgs_dropped   = __atomic_load_n(&fh->msgs_dropped, __ATOMIC_RELAXED);
+    if (bytes_received) *bytes_received = __atomic_load_n(&fh->bytes_received, __ATOMIC_RELAXED);
 }
