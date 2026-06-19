@@ -55,17 +55,61 @@ int mempool_init(mempool_t *mp, size_t object_size, uint32_t capacity);
 void mempool_destroy(mempool_t *mp);
 
 /**
- * Allocate one object from the pool (O(1)).
+ * Allocate one object from the pool — O(1), static inline (hot path).
  * Returns NULL if the pool is exhausted.
- * Thread-safe — can be called from multiple threads.
+ * Safe for single-producer or multi-producer with __ATOMIC_RELAXED fetch_sub.
  */
-void *mempool_alloc(mempool_t *mp);
+static inline void *mempool_alloc(mempool_t *mp) {
+    /* Atomically claim a free slot via fetch_sub on free_top.
+     * RELAXED sufficient for the counter: atomicity is all we need from
+     * free_top itself — the ACQUIRE on the free_list load pairs with
+     * the RELEASE store in mempool_free, guaranteeing we see the index
+     * written by the thread that freed this slot. */
+    uint32_t old_top = __atomic_fetch_sub(&mp->free_top, 1, __ATOMIC_RELAXED);
+    if (old_top == 0) {
+        /* Pool exhausted — undo the decrement */
+        __atomic_fetch_add(&mp->free_top, 1, __ATOMIC_RELAXED);
+        return NULL;
+    }
+
+    /* old_top was in [1, capacity]. Read the index with ACQUIRE ordering
+     * to pair with the RELEASE store in mempool_free. Without this barrier,
+     * we may see a stale free_list entry from before the freeing thread's
+     * store, resulting in a data race (UB) and potential double-allocation. */
+    uint32_t idx = __atomic_load_n(&mp->free_list[old_top - 1], __ATOMIC_ACQUIRE);
+    return (char *)mp->pool + (size_t)idx * mp->object_size;
+}
 
 /**
- * Return an object to the pool (O(1)).
- * Thread-safe.
+ * Return an object to the pool — O(1), static inline (hot path).
+ * Thread-safe for both single and multi-consumer free via fetch_add.
+ *
+ * Uses __atomic_fetch_add to atomically claim an exclusive free_list slot,
+ * eliminating the TOCTOU race present in the original load-then-store design.
+ * The RELEASE store on the slot guarantees the index is visible to any
+ * subsequent alloc's ACQUIRE load.
  */
-void mempool_free(mempool_t *mp, void *ptr);
+static inline void mempool_free(mempool_t *mp, void *ptr) {
+    uintptr_t offset = (uintptr_t)((char *)ptr - (char *)mp->pool);
+    uint32_t idx = (uint32_t)(offset / mp->object_size);
+    if (idx >= mp->capacity) return; /* Not from this pool */
+
+    /* Atomically claim the next free_list write slot.
+     * fetch_add guarantees each calling thread gets a unique slot,
+     * eliminating the TOCTOU race. */
+    uint32_t slot = __atomic_fetch_add(&mp->free_top, 1, __ATOMIC_RELAXED);
+    if (slot >= mp->capacity) {
+        /* Pool at capacity — indicates double-free or use-after-free.
+         * Undo the reservation and bail out silently. */
+        __atomic_fetch_sub(&mp->free_top, 1, __ATOMIC_RELAXED);
+        return;
+    }
+
+    /* Write the freed index to our exclusively-owned slot.
+     * __ATOMIC_RELEASE ensures this write is globally visible BEFORE
+     * any subsequent alloc's ACQUIRE load reads this slot. */
+    __atomic_store_n(&mp->free_list[slot], idx, __ATOMIC_RELEASE);
+}
 
 /**
  * Return the number of free objects remaining (snapshot).

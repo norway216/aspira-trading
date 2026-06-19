@@ -52,47 +52,6 @@ void ring_buffer_destroy(ring_buffer_t *rb) {
     rb->mask = 0;
 }
 
-bool ring_buffer_push(ring_buffer_t *rb, void *data) {
-    if (!rb || !data) return false;
-
-    /* Load head (producer-owned) */
-    uint32_t head = __atomic_load_n(&rb->head, __ATOMIC_RELAXED);
-    /* Load tail (consumer-owned). RELAXED is sufficient: producer only needs
-     * to know if the buffer is full; the actual slot ownership is guarded
-     * by the head release/acquire pair in push/pop respectively. */
-    uint32_t tail = __atomic_load_n(&rb->tail, __ATOMIC_RELAXED);
-
-    uint32_t next = (head + 1) & rb->mask;
-    if (next == tail) {
-        return false; /* Full */
-    }
-
-    rb->buffer[head] = data;
-
-    /* Publish — release ensures consumer sees the stored pointer */
-    __atomic_store_n(&rb->head, next, __ATOMIC_RELEASE);
-    return true;
-}
-
-void *ring_buffer_pop(ring_buffer_t *rb) {
-    if (!rb) return NULL;
-
-    /* Load tail (consumer-owned) */
-    uint32_t tail = __atomic_load_n(&rb->tail, __ATOMIC_RELAXED);
-    /* Load head (producer-owned) — acquire to see producer's writes */
-    uint32_t head = __atomic_load_n(&rb->head, __ATOMIC_ACQUIRE);
-
-    if (tail == head) {
-        return NULL; /* Empty */
-    }
-
-    void *data = rb->buffer[tail];
-
-    /* Publish — release ensures producer sees the freed slot */
-    __atomic_store_n(&rb->tail, (tail + 1) & rb->mask, __ATOMIC_RELEASE);
-    return data;
-}
-
 uint32_t ring_buffer_count(const ring_buffer_t *rb) {
     if (!rb) return 0;
     /* Snapshot — RELAXED is sufficient; inherently racy */

@@ -58,18 +58,49 @@ int ring_buffer_init(ring_buffer_t *rb, uint32_t capacity);
 void ring_buffer_destroy(ring_buffer_t *rb);
 
 /**
- * Producer-side: push one pointer into the buffer.
+ * Producer-side: push one pointer into the buffer (static inline — hot path).
  * Returns false if full (non-blocking).
  * NOT thread-safe — only ONE producer thread.
  */
-bool ring_buffer_push(ring_buffer_t *rb, void *data);
+static inline bool ring_buffer_push(ring_buffer_t *rb, void *data) {
+    /* Load head (producer-owned) */
+    uint32_t head = __atomic_load_n(&rb->head, __ATOMIC_RELAXED);
+    /* Load tail — RELAXED sufficient: only need full/not-full check */
+    uint32_t tail = __atomic_load_n(&rb->tail, __ATOMIC_RELAXED);
+
+    uint32_t next = (head + 1) & rb->mask;
+    if (next == tail) {
+        return false; /* Full */
+    }
+
+    rb->buffer[head] = data;
+
+    /* Publish — release ensures consumer sees the stored pointer */
+    __atomic_store_n(&rb->head, next, __ATOMIC_RELEASE);
+    return true;
+}
 
 /**
- * Consumer-side: pop one pointer from the buffer.
+ * Consumer-side: pop one pointer from the buffer (static inline — hot path).
  * Returns NULL if empty (non-blocking).
  * NOT thread-safe — only ONE consumer thread.
  */
-void *ring_buffer_pop(ring_buffer_t *rb);
+static inline void *ring_buffer_pop(ring_buffer_t *rb) {
+    /* Load tail (consumer-owned) */
+    uint32_t tail = __atomic_load_n(&rb->tail, __ATOMIC_RELAXED);
+    /* Load head — acquire to see producer's writes */
+    uint32_t head = __atomic_load_n(&rb->head, __ATOMIC_ACQUIRE);
+
+    if (tail == head) {
+        return NULL; /* Empty */
+    }
+
+    void *data = rb->buffer[tail];
+
+    /* Publish — release ensures producer sees the freed slot */
+    __atomic_store_n(&rb->tail, (tail + 1) & rb->mask, __ATOMIC_RELEASE);
+    return data;
+}
 
 /**
  * Return the number of elements currently in the buffer (snapshot).

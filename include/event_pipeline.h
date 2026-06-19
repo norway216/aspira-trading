@@ -21,6 +21,7 @@
 #include "risk_engine.h"
 #include "execution_gateway.h"
 #include "ring_buffer.h"
+#include <atomic>
 #include <pthread.h>
 #include <string>
 #include <vector>
@@ -159,7 +160,16 @@ private:
     /* Threads */
     pthread_t consumer_thread_;   /* Hot path: feed → strategy → risk → order book */
     pthread_t io_thread_;         /* I/O: journal writes, logging, gateway dispatch */
-    volatile bool running_;
+    std::atomic<bool> running_{false};
+
+    /* Two separate ring buffers for the I/O pipeline — avoids the race
+     * condition inherent in single-queue double-ended designs:
+     *   io_free_queue_: pool of pre-allocated IOEvents (hot path pops, I/O thread pushes)
+     *   io_filled_queue_: filled IOEvents awaiting I/O processing (hot path pushes, I/O thread pops)
+     * This is the standard correct pattern for producer-consumer event passing. */
+    ring_buffer_t io_free_queue_;
+    ring_buffer_t io_filled_queue_;
+    IOEvent *io_event_pool_;      /* Pre-allocated event objects */
 
     /* Two separate ring buffers for the I/O pipeline — avoids the race
      * condition inherent in single-queue double-ended designs:
@@ -173,8 +183,8 @@ private:
     /* Stats */
     PipelineStats stats_;
 
-    /* Order ID counter */
-    volatile int32_t next_order_id_;
+    /* Order ID counter — relaxed atomic: only atomicity needed, no ordering */
+    std::atomic<int32_t> next_order_id_{1};
 
     /* Strategy: generate orders from market data into pre-allocated array.
      * Writes up to 2 orders to out_orders and sets *out_count. */

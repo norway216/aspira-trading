@@ -32,15 +32,15 @@ extern "C" {
  */
 typedef struct {
     uint64_t timestamp_ns;    /* Exchange timestamp or receive time */
-    double   bid_price;
-    double   ask_price;
-    int32_t  bid_size;
-    int32_t  ask_size;
-    double   last_price;
-    int32_t  last_size;
-    int32_t  volume;
-    char     symbol[FEED_MAX_SYMBOL];
-    char     _pad[4];
+    double   bid_price;       /* 8 bytes */
+    double   ask_price;       /* 8 bytes */
+    double   last_price;      /* 8 bytes — grouped doubles for alignment */
+    int32_t  bid_size;        /* 4 bytes */
+    int32_t  ask_size;        /* 4 bytes */
+    int32_t  last_size;       /* 4 bytes */
+    int32_t  volume;          /* 4 bytes */
+    char     symbol[FEED_MAX_SYMBOL]; /* 16 bytes */
+    /* Total: 8+8+8+8+4+4+4+4+16 = 64 bytes — exactly one cache line */
 } feed_msg_t;
 
 /**

@@ -14,8 +14,13 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Default mmap region size (64 MB) */
-#define DEFAULT_MMAP_SIZE (64ULL * 1024 * 1024)
+/* Default mmap region size (256 MB).
+ * Sized large enough to avoid the expensive unmap+remap extension path
+ * for typical trading sessions (~100K records/hr × 48 bytes ≈ 5 MB/hr).
+ * At 5 MB/hr, 256 MB provides ~50 hours before extension is needed.
+ * Modern Linux systems have ample virtual address space; the physical
+ * pages are faulted in lazily on first access. */
+#define DEFAULT_MMAP_SIZE (256ULL * 1024 * 1024)
 
 struct journal_t {
     int fd;
@@ -59,7 +64,7 @@ static uint32_t crc32_update(uint32_t crc, const void *data, size_t len) {
 
 static uint64_t now_nanos(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 

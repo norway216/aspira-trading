@@ -46,7 +46,7 @@ struct feed_handler_t {
 
 static uint64_t now_nanos(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
@@ -107,28 +107,29 @@ static void simulate_message(feed_handler_t *fh, feed_msg_t *msg) {
 
 static void *recv_thread_func(void *arg) {
     feed_handler_t *fh = (feed_handler_t *)arg;
-    feed_msg_t msg_buf;
 
     if (fh->config.simulation_mode) {
-        /* Simulation mode: generate synthetic messages */
+        /* Simulation mode: generate synthetic messages.
+         * Allocate from pool FIRST, then fill directly — eliminates the
+         * stack-buffer + memcpy pattern (saves 64-byte copy per message). */
         fh->sim_base_price = 150.0; /* Starting price for AAPL */
         uint32_t interval = fh->config.sim_interval_us;
 
         while (__atomic_load_n(&fh->running, __ATOMIC_RELAXED)) {
-            simulate_message(fh, &msg_buf);
-
             /* Allocate from pre-allocated pool — no malloc in hot path */
-            feed_msg_t *msg_copy = (feed_msg_t *)mempool_alloc(&fh->msg_pool);
-            if (!msg_copy) {
+            feed_msg_t *msg = (feed_msg_t *)mempool_alloc(&fh->msg_pool);
+            if (!msg) {
                 __atomic_fetch_add(&fh->msgs_dropped, 1, __ATOMIC_RELAXED);
                 sleep_us(interval);
                 continue;
             }
-            memcpy(msg_copy, &msg_buf, sizeof(feed_msg_t));
 
-            if (!ring_buffer_push(&fh->output_queue, msg_copy)) {
+            /* Fill the message directly in pool memory — zero extra copies */
+            simulate_message(fh, msg);
+
+            if (!ring_buffer_push(&fh->output_queue, msg)) {
                 /* Queue full — drop the message, return to pool */
-                mempool_free(&fh->msg_pool, msg_copy);
+                mempool_free(&fh->msg_pool, msg);
                 __atomic_fetch_add(&fh->msgs_dropped, 1, __ATOMIC_RELAXED);
             } else {
                 __atomic_fetch_add(&fh->msgs_received, 1, __ATOMIC_RELAXED);
