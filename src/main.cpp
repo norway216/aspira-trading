@@ -19,12 +19,12 @@
  */
 #include "event_pipeline.h"
 #include "journal.h"
-#include <csignal>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <ctime>
 #include <getopt.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Global for signal handling */
@@ -74,12 +74,13 @@ static void print_stats(const EventPipeline &pipeline) {
 
     printf("\r");
     printf("  Market Data: %8lu | Orders: %6lu | Accepted: %6lu | "
-           "Rejected: %4lu | Trades: %6lu | Latency: %7.2f µs",
+           "Rejected: %4lu | Trades: %6lu | Drop: %4lu | Latency: %7.2f µs",
            (unsigned long)s.market_data_msgs,
            (unsigned long)s.orders_created,
            (unsigned long)s.orders_accepted,
            (unsigned long)s.orders_rejected,
            (unsigned long)s.trades_generated,
+           (unsigned long)s.io_events_dropped,
            s.avg_latency_us);
     fflush(stdout);
 }
@@ -227,6 +228,8 @@ int main(int argc, char *argv[]) {
            (unsigned long)final_stats.orders_executed);
     printf("║  Trades Generated:      %10lu                  ║\n",
            (unsigned long)final_stats.trades_generated);
+    printf("║  I/O Events Dropped:   %10lu                  ║\n",
+           (unsigned long)final_stats.io_events_dropped);
     printf("║  Average Latency:       %8.2f µs               ║\n",
            final_stats.avg_latency_us);
     printf("╠══════════════════════════════════════════════════════╣\n");

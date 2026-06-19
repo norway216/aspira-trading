@@ -57,10 +57,6 @@ static uint32_t crc32_update(uint32_t crc, const void *data, size_t len) {
     return crc;
 }
 
-static uint32_t crc32_compute(const void *data, size_t len) {
-    return crc32_update(0xFFFFFFFF, data, len) ^ 0xFFFFFFFF;
-}
-
 static uint64_t now_nanos(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -180,6 +176,8 @@ int journal_append(journal_t *jrnl, journal_record_type_t type,
             if (ftruncate(jrnl->fd, (off_t)new_size) < 0) {
                 return -1;
             }
+            /* Sync dirty pages before unmapping to avoid data loss */
+            msync(jrnl->mmap_base, (size_t)jrnl->mmap_offset, MS_SYNC);
             munmap(jrnl->mmap_base, (size_t)jrnl->mmap_size);
             jrnl->mmap_base = mmap(NULL, (size_t)new_size,
                                     PROT_READ | PROT_WRITE,

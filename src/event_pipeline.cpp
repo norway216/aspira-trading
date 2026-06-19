@@ -43,6 +43,41 @@ EventPipeline::EventPipeline()
 
 EventPipeline::~EventPipeline() {
     stop();
+
+    /* Destroy resources in reverse order of creation */
+    if (feed_handler_) {
+        feed_destroy(feed_handler_);
+        feed_handler_ = nullptr;
+    }
+
+    if (gateway_) {
+        gw_destroy(gateway_);
+        gateway_ = nullptr;
+    }
+
+    delete risk_engine_;
+    risk_engine_ = nullptr;
+
+    delete order_book_;
+    order_book_ = nullptr;
+
+    if (io_event_pool_) {
+        /* Drain remaining events from the I/O queues before destroying them.
+         * At this point the threads are stopped, so no concurrent access. */
+        IOEvent *ev;
+        while ((ev = (IOEvent *)ring_buffer_pop(&io_free_queue_)) != nullptr) {}
+        while ((ev = (IOEvent *)ring_buffer_pop(&io_filled_queue_)) != nullptr) {}
+        free(io_event_pool_);
+        io_event_pool_ = nullptr;
+    }
+
+    ring_buffer_destroy(&io_filled_queue_);
+    ring_buffer_destroy(&io_free_queue_);
+
+    if (logger_) {
+        logger_destroy(logger_);
+        logger_ = nullptr;
+    }
 }
 
 /* ---- Initialization ---- */
@@ -234,6 +269,8 @@ void EventPipeline::process_market_data(feed_msg_t *msg) {
                         sizeof(ioev->reject_reason) - 1);
                 ioev->send_to_gateway = false;
                 ring_buffer_push(&io_filled_queue_, ioev);
+            } else {
+                stats_.io_events_dropped++;
             }
             continue;
         }
@@ -282,6 +319,8 @@ void EventPipeline::process_market_data(feed_msg_t *msg) {
                 ioev->gw_msg_len = gw_msg_len;
             }
             ring_buffer_push(&io_filled_queue_, ioev);
+        } else {
+            stats_.io_events_dropped++;
         }
 
         /* Check for trades generated */
@@ -301,6 +340,8 @@ void EventPipeline::process_market_data(feed_msg_t *msg) {
                 tev->trade_ts_ns = trade.timestamp_ns;
                 memcpy(tev->trade_symbol, trade.symbol, sizeof(tev->trade_symbol));
                 ring_buffer_push(&io_filled_queue_, tev);
+            } else {
+                stats_.io_events_dropped++;
             }
         }
 
@@ -532,6 +573,7 @@ void EventPipeline::stop() {
     LOG_INFO_(logger_, "  Orders rejected:   %lu", (unsigned long)stats_.orders_rejected);
     LOG_INFO_(logger_, "  Orders executed:   %lu", (unsigned long)stats_.orders_executed);
     LOG_INFO_(logger_, "  Trades generated:  %lu", (unsigned long)stats_.trades_generated);
+    LOG_INFO_(logger_, "  I/O events dropped:%lu", (unsigned long)stats_.io_events_dropped);
     LOG_INFO_(logger_, "  Avg latency (us):  %.2f", stats_.avg_latency_us);
 
     /* Shutdown logger */

@@ -65,9 +65,7 @@ Order OrderBook::match_limit_order(Order &order) {
                 Order &resting = entry_it->order;
 
                 int32_t match_qty = std::min(order.remaining(), resting.remaining());
-                double match_price = (order.type == OrderType::MARKET)
-                                         ? ask_price
-                                         : ask_price;
+                double match_price = ask_price;
 
                 /* Update resting order */
                 resting.filled_qty += match_qty;

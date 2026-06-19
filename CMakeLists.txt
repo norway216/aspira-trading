@@ -51,7 +51,9 @@ endif()
 add_compile_definitions(TRADING_MEASURE_LATENCY)
 
 # Include directories
-include_directories(${CMAKE_SOURCE_DIR}/include)
+# Use target-scoped includes (modern CMake best practice)
+add_library(trading_common INTERFACE)
+target_include_directories(trading_common INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
 # Source files
 set(C_SOURCES
@@ -76,8 +78,8 @@ add_executable(trading_engine
     ${CXX_SOURCES}
 )
 
-# Link libraries
 target_link_libraries(trading_engine PRIVATE
+    trading_common
     pthread
     rt
 )
@@ -91,19 +93,19 @@ if(BUILD_TESTS)
         tests/test_ring_buffer.c
         src/ring_buffer.c
     )
-    target_link_libraries(test_ring_buffer PRIVATE pthread rt)
+    target_link_libraries(test_ring_buffer PRIVATE trading_common pthread rt)
 
     add_executable(test_memory_pool
         tests/test_memory_pool.c
         src/memory_pool.c
     )
-    target_link_libraries(test_memory_pool PRIVATE pthread rt)
+    target_link_libraries(test_memory_pool PRIVATE trading_common pthread rt)
 
     add_executable(test_order_book
         tests/test_order_book.cpp
         src/order_book.cpp
     )
-    target_link_libraries(test_order_book PRIVATE pthread rt)
+    target_link_libraries(test_order_book PRIVATE trading_common pthread rt)
 
     add_test(NAME ring_buffer_test COMMAND test_ring_buffer)
     add_test(NAME memory_pool_test COMMAND test_memory_pool)
