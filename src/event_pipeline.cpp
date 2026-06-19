@@ -498,6 +498,7 @@ void EventPipeline::io_loop() {
         IOEvent *event = (IOEvent *)ring_buffer_pop(&io_filled_queue_);
         if (event) {
             empty_spins = 0;
+
             process_io_event(*event);
 
             /* Return event to the free pool for reuse by the hot path */
@@ -511,6 +512,7 @@ void EventPipeline::io_loop() {
                 usleep(50);
                 empty_spins = 0;
             }
+
         }
     }
 
@@ -569,7 +571,6 @@ void EventPipeline::stop() {
     if (!running_.load(std::memory_order_relaxed)) return;
 
     LOG_INFO_(logger_, "EventPipeline stopping...");
-
     /* Signal threads to stop (atomic store with release to ensure visibility) */
     running_.store(false, std::memory_order_release);
     pthread_join(consumer_thread_, nullptr);
