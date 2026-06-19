@@ -35,6 +35,9 @@ struct logger_t {
 
 static uint64_t now_nanos(void) {
     struct timespec ts;
+    /* CLOCK_REALTIME — logger needs wall-clock timestamps for human-readable
+     * log output and correlation with real-world events. Other components use
+     * CLOCK_MONOTONIC for latency measurement where ordering matters. */
     clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }

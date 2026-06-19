@@ -17,10 +17,10 @@
 #include <ctime>
 #include <unistd.h>
 
-/* ---- Helper: generate a unique order ID (relaxed atomic — no full barrier needed) ---- */
+/* ---- Helper: generate a unique order ID (relaxed atomic — only atomicity needed) ---- */
 
-static int32_t generate_order_id(volatile int32_t &counter) {
-    return __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED);
+static int32_t generate_order_id(std::atomic<int32_t> &counter) {
+    return counter.fetch_add(1, std::memory_order_relaxed);
 }
 
 /* ---- Construction / Destruction ---- */
@@ -32,9 +32,7 @@ EventPipeline::EventPipeline()
       risk_engine_(nullptr),
       gateway_(nullptr),
       feed_handler_(nullptr),
-      running_(false),
-      io_event_pool_(nullptr),
-      next_order_id_(1)
+      io_event_pool_(nullptr)
 {
     memset(&stats_, 0, sizeof(stats_));
     memset(&io_free_queue_, 0, sizeof(io_free_queue_));
@@ -453,14 +451,25 @@ void EventPipeline::process_io_event(const IOEvent &event) {
 
 void EventPipeline::consumer_loop() {
     ring_buffer_t *queue = feed_get_output_queue(feed_handler_);
+    int empty_spins = 0;
 
-    while (running_) {
+    while (running_.load(std::memory_order_relaxed)) {
         feed_msg_t *msg = (feed_msg_t *)ring_buffer_pop(queue);
         if (msg) {
+            empty_spins = 0;
             process_market_data(msg);
         } else {
-            /* No data — brief yield to avoid busy-waiting */
-            usleep(50); /* 50 µs */
+            /* No data — progressive backoff to balance latency vs CPU usage.
+             * Spin up to 1000 iterations (~1-2 µs), then yield to kernel.
+             * This avoids the ~50 µs usleep() syscall penalty on empty queues
+             * while still capping CPU usage when idle. */
+            if (empty_spins < 1000) {
+                empty_spins++;
+                __builtin_ia32_pause(); /* CPU relax — ~10 cycles on x86 */
+            } else {
+                usleep(50);
+                empty_spins = 0;
+            }
         }
     }
 
@@ -482,17 +491,26 @@ void *EventPipeline::consumer_thread_func(void *arg) {
 /* ---- I/O Thread (Stage 2: Journal + Logging + Gateway) ---- */
 
 void EventPipeline::io_loop() {
-    while (running_) {
+    int empty_spins = 0;
+
+    while (running_.load(std::memory_order_relaxed)) {
         /* Pop from filled queue — only filled events arrive here */
         IOEvent *event = (IOEvent *)ring_buffer_pop(&io_filled_queue_);
         if (event) {
+            empty_spins = 0;
             process_io_event(*event);
 
             /* Return event to the free pool for reuse by the hot path */
             ring_buffer_push(&io_free_queue_, event);
         } else {
-            /* Queue empty — brief sleep to avoid busy-waiting */
-            usleep(50);
+            /* Progressive backoff: spin briefly, then yield */
+            if (empty_spins < 1000) {
+                empty_spins++;
+                __builtin_ia32_pause();
+            } else {
+                usleep(50);
+                empty_spins = 0;
+            }
         }
     }
 
@@ -514,7 +532,7 @@ void *EventPipeline::io_thread_func(void *arg) {
 /* ---- Start / Stop ---- */
 
 int EventPipeline::start() {
-    if (running_) return 0;
+    if (running_.load(std::memory_order_relaxed)) return 0;
 
     LOG_INFO_(logger_, "EventPipeline starting...");
 
@@ -525,9 +543,9 @@ int EventPipeline::start() {
     }
 
     /* Start I/O thread first (must be ready to consume events) */
-    running_ = true;
+    running_.store(true, std::memory_order_relaxed);
     if (pthread_create(&io_thread_, nullptr, io_thread_func, this) != 0) {
-        running_ = false;
+        running_.store(false, std::memory_order_relaxed);
         feed_stop(feed_handler_);
         LOG_ERROR_(logger_, "Failed to create I/O thread");
         return -1;
@@ -536,7 +554,7 @@ int EventPipeline::start() {
     /* Start consumer thread (hot path) */
     if (pthread_create(&consumer_thread_, nullptr,
                        consumer_thread_func, this) != 0) {
-        running_ = false;
+        running_.store(false, std::memory_order_relaxed);
         pthread_join(io_thread_, nullptr);
         feed_stop(feed_handler_);
         LOG_ERROR_(logger_, "Failed to create consumer thread");
@@ -548,12 +566,12 @@ int EventPipeline::start() {
 }
 
 void EventPipeline::stop() {
-    if (!running_) return;
+    if (!running_.load(std::memory_order_relaxed)) return;
 
     LOG_INFO_(logger_, "EventPipeline stopping...");
 
-    /* Stop consumer thread first (no more events generated) */
-    running_ = false;
+    /* Signal threads to stop (atomic store with release to ensure visibility) */
+    running_.store(false, std::memory_order_release);
     pthread_join(consumer_thread_, nullptr);
 
     /* Stop feed handler */
