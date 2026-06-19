@@ -104,16 +104,27 @@ int EventPipeline::init(const std::string &symbol,
         return -1;
     }
 
-    /* Configure risk limits — generous for demo purposes */
+    /* Configure risk limits — generous for demo purposes.
+     * Use int64_t for institutional-scale quantities. */
     RiskLimits limits;
-    limits.max_order_qty     = 10000;
-    limits.max_position      = 10000000;
-    limits.max_exposure      = 50000000;
-    limits.max_notional      = 500000000.0;
-    limits.price_band_pct    = 10.0;   /* 10% from mid */
-    limits.max_orders_per_sec = 50000;
-    limits.enabled           = true;
+    limits.max_order_qty             = 100000;     /* 100K shares per order */
+    limits.max_single_order_notional = 5000000.0;  /* $5M max single order */
+    limits.max_position              = 10000000;   /* 10M net position */
+    limits.max_exposure              = 50000000;   /* 50M gross exposure */
+    limits.max_notional_per_symbol   = 500000000.0;/* $500M notional per symbol */
+    limits.max_portfolio_exposure    = 1000000000.0;/* $1B portfolio cap */
+    limits.max_position_pct          = 0.25;       /* 25% of equity max */
+    limits.price_band_pct            = 10.0;       /* 10% from mid */
+    limits.max_orders_per_sec        = 50000;      /* sustained rate */
+    limits.burst_capacity            = 100000;     /* burst capacity (token bucket) */
+    limits.safe_mode_reject_pct      = 80.0;       /* enter SAFE MODE >80% reject */
+    limits.safe_mode_latency_us      = 5000.0;     /* enter SAFE MODE >5ms latency */
+    limits.safe_mode_consecutive     = 100;        /* enter SAFE MODE after 100 rejects */
+    limits.enabled                   = true;
     risk_engine_->set_limits(limits);
+
+    /* Add trading symbol to instrument allowlist */
+    risk_engine_->allow_symbol(symbol.c_str());
 
     /* 4. Execution Gateway (simulation mode) */
     gw_config_t gw_cfg;
@@ -368,6 +379,22 @@ void EventPipeline::process_market_data(feed_msg_t *msg) {
         stats_.avg_latency_us = stats_.avg_latency_us * 0.9 + latency_us * 0.1;
     }
 #endif
+
+    /* Feed health metrics to RiskEngine for SAFE MODE auto-triggers (§11).
+     * Computes reject rate over the current window and updates periodically.
+     * Runs outside the LATENCY ifdef so SAFE MODE triggers work even when
+     * latency measurement is disabled. */
+    {
+        static uint64_t health_update_counter = 0;
+        if (++health_update_counter % 100 == 0) { /* Every ~100 messages */
+            double reject_rate = 0.0;
+            if (stats_.orders_created > 0) {
+                reject_rate = (double)stats_.orders_rejected
+                              / (double)stats_.orders_created * 100.0;
+            }
+            risk_engine_->update_health_metrics(reject_rate, stats_.avg_latency_us);
+        }
+    }
 }
 
 /* ---- Stage 2: I/O Event Processing (I/O Thread) ---- */

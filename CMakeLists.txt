@@ -107,9 +107,16 @@ if(BUILD_TESTS)
     )
     target_link_libraries(test_order_book PRIVATE trading_common pthread rt)
 
+    add_executable(test_risk_engine
+        tests/test_risk_engine.cpp
+        src/risk_engine.cpp
+    )
+    target_link_libraries(test_risk_engine PRIVATE trading_common pthread rt)
+
     add_test(NAME ring_buffer_test COMMAND test_ring_buffer)
     add_test(NAME memory_pool_test COMMAND test_memory_pool)
     add_test(NAME order_book_test COMMAND test_order_book)
+    add_test(NAME risk_engine_test COMMAND test_risk_engine)
 endif()
 
 # Install
