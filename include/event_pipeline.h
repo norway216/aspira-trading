@@ -171,15 +171,6 @@ private:
     ring_buffer_t io_filled_queue_;
     IOEvent *io_event_pool_;      /* Pre-allocated event objects */
 
-    /* Two separate ring buffers for the I/O pipeline — avoids the race
-     * condition inherent in single-queue double-ended designs:
-     *   io_free_queue_: pool of pre-allocated IOEvents (hot path pops, I/O thread pushes)
-     *   io_filled_queue_: filled IOEvents awaiting I/O processing (hot path pushes, I/O thread pops)
-     * This is the standard correct pattern for producer-consumer event passing. */
-    ring_buffer_t io_free_queue_;
-    ring_buffer_t io_filled_queue_;
-    IOEvent *io_event_pool_;      /* Pre-allocated event objects */
-
     /* Stats */
     PipelineStats stats_;
 
